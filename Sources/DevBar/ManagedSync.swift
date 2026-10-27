@@ -99,8 +99,8 @@ enum ManagedSync {
             let keys = leaves(selected)
             guard keys.contains(where: { belongs(stored(root, target: $0)) }) else { return nil }
             let states = keys.map { status(path: root, target: $0).state }
-            if states.allSatisfy({ $0 == "current" }) { return RuntimeFreshness(state: .verified, reason: "全部成员的运行版本证据一致；未验收页面业务流程") }
-            if states.contains("sourceChanged") { return RuntimeFreshness(state: .sourceChanged, reason: "组合目标的源码有变化") }
+            if states.allSatisfy({ $0 == "current" }) { return RuntimeFreshness(state: .current, reason: "全部成员的运行版本证据一致；未验收页面业务流程") }
+            if states.contains("sourceChanged") { return RuntimeFreshness(state: .stale, reason: "组合目标的源码有变化") }
             return RuntimeFreshness(state: .unknown, reason: "组合目标未全部通过运行版本核对")
         }
         let keys = config.targets.keys.sorted { left, right in
@@ -109,15 +109,15 @@ enum ManagedSync {
         }
         for key in keys {
             if config.targets[key]?.strategy == "process" {
-                if let state = DevelopmentRuntime.state(root, target: key, exact: true), state.phase != "failed" {
-                    return RuntimeFreshness(state: .development, reason: state.reason)
+                if let state = DevelopmentRuntime.state(root, target: key, exact: true), state.phase != .failed {
+                    return RuntimeFreshness(state: .current, reason: state.reason)
                 }
                 continue
             }
             guard belongs(stored(root, target: key)) else { continue }
             let value = status(path: root, target: key)
-            if value.state == "current" { return RuntimeFreshness(state: .verified, reason: value.reason) }
-            if value.state == "sourceChanged" { return RuntimeFreshness(state: .sourceChanged, reason: value.reason) }
+            if value.state == "current" { return RuntimeFreshness(state: .current, reason: value.reason) }
+            if value.state == "sourceChanged" { return RuntimeFreshness(state: .stale, reason: value.reason) }
             return RuntimeFreshness(state: .unknown, reason: value.reason)
         }
         return nil
@@ -319,8 +319,8 @@ enum ManagedSync {
         if (try? SyncRouter.configuration(path: root))?.targets[target]?.strategy == "process" {
             let current = try? plan(path: root, target: target)
             if let state = DevelopmentRuntime.state(root, target: target, exact: true) {
-                let mapped: String = state.phase == "failed" ? "failed" : "current"
-                return ManagedReport(state: mapped, reason: state.phase == "failed" ? state.reason : "开发会话运行中；" + state.reason, plan: current)
+                let mapped: String = state.phase == .failed ? "failed" : "current"
+                return ManagedReport(state: mapped, reason: state.phase == .failed ? state.reason : "开发会话运行中；" + state.reason, plan: current)
             }
             return ManagedReport(state: "stopped", reason: "开发会话未运行", plan: current)
         }
@@ -364,7 +364,7 @@ enum ManagedSync {
     /// sync 只负责确保会话按当前配置在运行；不再做一次性冷启动与版本回执。
     private static func sessionSync(_ plan: ManagedPlan) -> ManagedReport {
         do {
-            if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true), state.phase != "failed" {
+            if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true), state.phase != .failed {
                 return ManagedReport(state: "current", reason: state.reason.isEmpty ? "开发会话已在运行" : state.reason, plan: plan)
             }
             let store = ProjectStore()
@@ -388,8 +388,8 @@ enum ManagedSync {
             let deadline = Date().addingTimeInterval(15)
             while Date() < deadline {
                 if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true) {
-                    if state.phase == "failed" { return ManagedReport(state: "failed", reason: state.reason, plan: plan) }
-                    if state.phase != "starting" { return ManagedReport(state: "current", reason: "开发会话已启动；" + state.reason, plan: plan) }
+                    if state.phase == .failed { return ManagedReport(state: "failed", reason: state.reason, plan: plan) }
+                    if state.phase != .starting { return ManagedReport(state: "current", reason: "开发会话已启动；" + state.reason, plan: plan) }
                 } else if let run = store.targetRun(recordID, plan.target), run.exitCode != nil {
                     return ManagedReport(state: "failed", reason: "开发会话监督进程已退出（退出码 \(run.exitCode.map(String.init) ?? "?")）；详情见日志", plan: plan)
                 }

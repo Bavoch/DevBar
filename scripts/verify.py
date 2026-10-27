@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix="DevBar fixture ", dir=root / "work") as
         assert entry['action'] == 'openURL:' and entry['value'] == f'http://localhost:{port}'
         more = next(row['items'] for row in menu if row['title'] == '更多')
         assert next(row for row in more if row['title'] == '复制地址')['action'] == 'copyURL:'
-        assert [row['title'] for row in menu if row.get('action') and row.get('action') != 'submenuAction:'] == ['打开网页', '停止']
+        assert [row['title'] for row in menu if row.get('action') and row.get('action') != 'submenuAction:'] == ['打开网页', '停止项目进程']
         assert not any('辅助服务' in row['title'] or '进程详情' in row['title'] for row in menu)
         assert not any('更新于' in row['title'] for row in menus)
         print('PASS: compact native menu exposes open/stop; copy and management remain available in More')

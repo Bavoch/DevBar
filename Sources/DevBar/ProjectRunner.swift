@@ -68,7 +68,7 @@ enum ProjectRunner {
         if let target = ProjectProfiles.selected(project), project.command == target.command, let issue = TargetRuntime.environmentIssue(target) { throw failure(issue) }
         let previous = store.targetRun(project.id, targetID(project)) ?? store.run(project.id)
         if let previous, ProcessTable.active(previous, table: try ProcessTable.read()),
-           let state = DevelopmentRuntime.state(project.path, target: previous.targetID, exact: true), state.phase == "failed" {
+           let state = DevelopmentRuntime.state(project.path, target: previous.targetID, exact: true), state.phase == .failed {
             _ = try stop(path: project.path, store: store, targetID: previous.targetID)
         }
         // Development is independent of the optional installation/sync protocol.

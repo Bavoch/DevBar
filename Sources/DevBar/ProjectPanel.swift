@@ -378,13 +378,13 @@ final class ProjectPanelView: NSView {
         view.tabs.selectedSegment = 0
         view.tabChanged()
         var stale = model("Running", open: item("open"))
-        stale.freshness = RuntimeFreshness(state: .outdated, reason: "发现较新的构建")
+        stale.freshness = RuntimeFreshness(state: .stale, reason: "本地源码已变")
         view.update([stale], running: 1, error: nil, scanning: false)
-        precondition(!stable.freshnessBadge.isHidden && stable.freshnessBadge.accessibilityLabel() == "需要更新")
+        precondition(!stable.freshnessBadge.isHidden && stable.freshnessBadge.accessibilityLabel() == "源码已变")
         stale.freshness = RuntimeFreshness(state: .unknown, reason: "待确认")
         view.update([stale], running: 1, error: nil, scanning: false)
         precondition(stable.freshnessBadge.accessibilityLabel() == "版本待确认")
-        stale.freshness = RuntimeFreshness(state: .development, reason: "热更新")
+        stale.freshness = RuntimeFreshness(state: .current, reason: "运行中")
         view.update([stale], running: 1, error: nil, scanning: false)
         precondition(stable.freshnessBadge.isHidden)
         var escaped = false
@@ -411,7 +411,7 @@ final class ProjectPanelView: NSView {
         precondition(view.footer.stringValue == "检测失败")
         if let output {
             var native = model("Native project", open: item("open"))
-            native.freshness = RuntimeFreshness(state: .outdated, reason: "本地有较新的构建")
+            native.freshness = RuntimeFreshness(state: .stale, reason: "本地源码已变")
             view.update([model("Web project", open: item("open")), native, model("Starting", busy: true), model("Failed", running: false, failed: true), model("Stopped", running: false)], running: 3, error: nil, scanning: false)
             window.setContentSize(view.frame.size)
             try view.render(to: output)

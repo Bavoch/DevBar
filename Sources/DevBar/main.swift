@@ -413,7 +413,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var refreshRequested = false
     private var configRevision = 0
     private let iconLoader = ProjectIconLoader()
-    private let freshnessInspector = RuntimeFreshnessInspector()
     private var iconAssets: [String: ProjectIconAsset] = [:]
     private var projectImages: [String: NSImage] = [:]
     private lazy var fallbackIcon: NSImage? = {
@@ -524,7 +523,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let revision = configRevision
         let store = self.store
         let iconLoader = self.iconLoader
-        let freshnessInspector = self.freshnessInspector
         DispatchQueue.global(qos: .utility).async {
             let result = Result { () -> ([Project], [SavedProject], ProjectPresentation, [String: ProjectIconAsset]) in
                 let known = try store.load()
@@ -540,7 +538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                         ], entryPoints: [], auxiliaryServices: []))
                     }
                 }
-                for index in projects.indices { projects[index].freshness = freshnessInspector.inspect(projects[index], persist: true) }
+                for index in projects.indices { projects[index].freshness = RuntimeFreshnessInspector.inspect(projects[index], persist: true) }
                 let icons = iconLoader.load(paths: projects.map(\.path) + saved.map(\.path))
                 return (projects.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }, saved, presentation, icons)
             }
@@ -599,7 +597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             let project = running[path]
             let config = configs[path]
             let operation = operations[path]
-            let developmentFailure = project?.freshness?.reason.hasPrefix("开发命令已退出") == true
+            let developmentFailure = project?.freshness?.state == .failed
             let failed = developmentFailure || (config.flatMap { runs[$0.id]?.exitCode }.map { ![0, 130, 143].contains($0) } ?? false)
             let detail: String
             if let message = messages[path] { detail = message }
@@ -629,7 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             models.append(PanelProject(path: path, name: row.title, detail: detail, running: project != nil,
                 busy: operation != nil, failed: messages[path] != nil || failed, icon: projectImages[path] ?? fallbackIcon,
                 open: child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) }, control: control, more: options,
-                freshness: project?.desktop?.pid == nil && project?.hasReadyEndpoint == true ? nil : project?.freshness))
+                freshness: project?.freshness))
         }
         let maxHeight = (item?.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 700
         panel.update(models, running: projects.count, error: error, scanning: scanning, maxHeight: min(680, maxHeight - 48))
@@ -1342,8 +1340,9 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
         let store = ProjectStore()
         let saved = try store.load()
         guard let project = try Discovery.scan(knownPaths: saved.map(\.path) + [path]).first(where: { $0.path == URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path }) else { throw failure("项目未运行") }
-        let report = RuntimeFreshnessInspector().inspect(project, persist: cliValue("--record-runtime") != nil)
-        print(String(decoding: try JSONEncoder().encode(report), as: UTF8.self))
+        let report = RuntimeFreshnessInspector.inspect(project, persist: cliValue("--record-runtime") != nil)
+        if let report { print(String(decoding: try JSONEncoder().encode(report), as: UTF8.self)) }
+        else { print("{\"state\":\"none\",\"reason\":\"无开发会话或受管回执，不显示版本徽章\"}") }
     } catch { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(1) }
 } else if let path = cliValue("--desktop-project") ?? cliValue("--open-desktop-project") {
     do {
@@ -1448,8 +1447,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
                 ], entryPoints: [], auxiliaryServices: []))
             }
         }
-        let freshnessInspector = RuntimeFreshnessInspector()
-        for index in projects.indices { projects[index].freshness = freshnessInspector.inspect(projects[index], persist: false) }
+        for index in projects.indices { projects[index].freshness = RuntimeFreshnessInspector.inspect(projects[index], persist: false) }
         if let output = cliValue("--render-panel") {
             try MainActor.assumeIsolated {
                 NSApplication.shared.setActivationPolicy(.prohibited)

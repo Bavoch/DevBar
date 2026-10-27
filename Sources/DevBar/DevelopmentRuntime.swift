@@ -5,9 +5,10 @@ import Darwin
 /// One development session owns the command and its reload lifecycle. Installation
 /// receipts and .devbar.json never participate in deciding what to run.
 enum DevelopmentRuntime {
+    enum Phase: String, Codable { case starting, watching, failed }
     struct State: Codable {
         let supervisor: LiveProcess
-        let phase: String
+        let phase: Phase
         let reason: String
     }
     static func stateURL(_ path: String, target: String? = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"]) -> URL {
@@ -129,7 +130,7 @@ enum DevelopmentRuntime {
         guard let identity = try ProcessTable.read(Int(getpid()))[Int(getpid())] else { throw failure("无法记录开发会话") }
         let file = stateURL(root.path)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        func record(_ phase: String, _ reason: String) throws {
+        func record(_ phase: Phase, _ reason: String) throws {
             try ProjectStore().write(State(supervisor: identity, phase: phase, reason: reason), to: file)
             print("DevBar: " + reason); fflush(stdout)
         }
@@ -154,7 +155,7 @@ enum DevelopmentRuntime {
         let flutter = expanded(command, root: root).range(of: #"\bflutter\s+run\b"#, options: .regularExpression) != nil
         var input: Pipe?
         func start() throws {
-            try record("starting", "正在启动开发会话…")
+            try record(.starting, "正在启动开发会话…")
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/zsh")
             task.arguments = ["-lc", CommandExecution.bootstrap, "DevBar development", root.path, command]
@@ -169,7 +170,7 @@ enum DevelopmentRuntime {
             if nativeWatcher { watchingReason = "开发命令运行中；工具链负责监听，实际界面更新尚未核验" }
             else if watchDisabled { watchingReason = "开发命令运行中；源码监视不可用（项目过大或读取失败），修改后请手动重启会话" }
             else { watchingReason = "开发命令运行中；源码变化后自动重启，实际界面更新尚未核验" }
-            try record("watching", watchingReason)
+            try record(.watching, watchingReason)
         }
         var watchDisabled: Bool
         var baseline: [String: String]
@@ -186,7 +187,7 @@ enum DevelopmentRuntime {
                 try stopChild()
                 var reason = "开发命令已退出（\(code)）；修改源码后自动重试，详情见日志"
                 if let hint = DesktopApplications.installedConflictHint(path: root.path) { reason += "；" + hint }
-                try record("failed", reason)
+                try record(.failed, reason)
                 if let refreshed = safeSnapshot(root) { baseline = refreshed } else { watchDisabled = true }
                 pending = baseline; changedAt = nil
             }
