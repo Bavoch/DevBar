@@ -7,7 +7,6 @@ struct SavedProject: Codable, Equatable {
     var path: String
     var command: String
     var targetID: String? = nil
-    var autoUpdateTarget: String? = nil
 
     init(id: String = UUID().uuidString, name: String, path: String, command: String) {
         self.id = id

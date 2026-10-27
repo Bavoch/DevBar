@@ -468,11 +468,6 @@ enum ManagedSync {
                 guard verifiedProof != nil else { throw failure("外部运行证据超时：\(lastError?.localizedDescription ?? "未返回版本证据")") }
             } else {
                 guard let command = plan.startCommand else { throw failure("缺少运行命令") }
-                let root = URL(fileURLWithPath: plan.project)
-                if plan.strategy == "process", (try? DevelopmentRuntime.validate(command, root: root)) != nil,
-                   DevelopmentRuntime.isDesktop(command, root: root) {
-                    try DesktopApplications.stopInstalledConflicts(path: plan.project)
-                }
                 started = try CommandExecution.spawn(command: command, directory: plan.project, log: log!, environment: env)
                 let deadline = Date().addingTimeInterval(plan.timeout)
                 var ready = false

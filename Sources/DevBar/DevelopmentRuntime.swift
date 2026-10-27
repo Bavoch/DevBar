@@ -85,12 +85,6 @@ enum DevelopmentRuntime {
         }
     }
 
-    static func isDesktop(_ command: String, root: URL) -> Bool {
-        let targets = ProjectProfiles.profile(root.path).targets
-        if let target = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"],
-           let selected = targets.first(where: { $0.id == target }) { return selected.kind == .desktop }
-        return targets.first(where: { $0.command == command })?.kind == .desktop
-    }
     static func snapshot(_ root: URL) throws -> [String: String] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
         var scanError: Error?
@@ -157,9 +151,6 @@ enum DevelopmentRuntime {
         var input: Pipe?
         func start() throws {
             try record("starting", "正在启动开发会话…")
-            if isDesktop(command, root: root) {
-                try DesktopApplications.stopInstalledConflicts(path: root.path)
-            }
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/zsh")
             task.arguments = ["-lc", CommandExecution.bootstrap, "DevBar development", root.path, command]
@@ -182,7 +173,9 @@ enum DevelopmentRuntime {
             if let task = process, !task.isRunning {
                 let code = task.terminationStatus
                 try stopChild()
-                try record("failed", "开发命令已退出（\(code)）；修改源码后自动重试，详情见日志")
+                var reason = "开发命令已退出（\(code)）；修改源码后自动重试，详情见日志"
+                if let hint = DesktopApplications.installedConflictHint(path: root.path) { reason += "；" + hint }
+                try record("failed", reason)
                 baseline = try snapshot(root); pending = baseline; changedAt = nil
             }
             // Do not duplicate a framework's filesystem watcher or continuously

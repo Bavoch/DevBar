@@ -1485,22 +1485,6 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
         fputs("DevBar: \(error.localizedDescription)\n", stderr)
         exit(1)
     }
-} else if CommandLine.arguments.contains("--self-test-auto-update") {
-    AutomaticUpdates.verify()
-    try ProjectUpdateSetup.verify()
-} else if let path = cliValue("--test-auto-update-project") {
-    NSApplication.shared.setActivationPolicy(.prohibited)
-    let updater = AutomaticUpdates(delay: 2)
-    let target = cliValue("--target") ?? "desktop"
-    let plan = try ProjectSync.plan(path: path, target: target)
-    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL?.path == plan.installPath && !$0.isTerminated }) else { return }
-        updater.poll([AutomaticUpdates.Job(path: path, target: target, bundlePath: plan.installPath, pid: Int(app.processIdentifier))], binary: URL(fileURLWithPath: CommandLine.arguments[0])) { event in
-            print(event.state + ": " + event.reason); fflush(stdout)
-        }
-    }
-    RunLoop.main.add(timer, forMode: .common)
-    RunLoop.main.run()
 } else if CommandLine.arguments.contains("--self-test-freshness") {
     try RuntimeFreshnessInspector.verify()
 } else if CommandLine.arguments.contains("--self-test-dismissal") {

@@ -106,17 +106,13 @@ enum DesktopApplications {
         }
     }
 
-    static func stopInstalledConflicts(path: String) throws {
-        for candidate in installedConflicts(path: path, candidates: candidates()) {
-            guard let app = NSRunningApplication(processIdentifier: pid_t(candidate.pid)), !app.isTerminated,
-                  app.bundleIdentifier == candidate.identifier, app.executableURL?.path == candidate.executable,
-                  app.launchDate == candidate.launchedAt else { continue }
-            print("DevBar: 正在退出同一产品的安装实例，切换到源码开发会话…"); fflush(stdout)
-            guard app.terminate() else { throw failure("安装实例未接受退出请求；开发会话未启动，请先退出该应用") }
-            let deadline = Date().addingTimeInterval(8)
-            while !app.isTerminated && Date() < deadline { CommandExecution.pump() }
-            guard app.isTerminated else { throw failure("安装实例仍在运行；开发会话未启动，未强制结束该应用") }
-        }
+    /// 安装版与开发会话共享单实例锁/端口时只是提示，绝不代替用户退出应用。
+    static func installedConflictHint(path: String) -> String? {
+        let conflicts = installedConflicts(path: path, candidates: candidates())
+        guard !conflicts.isEmpty else { return nil }
+        let names = Set(conflicts.compactMap { $0.bundlePath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } })
+        let product = names.sorted().joined(separator: "、")
+        return "检测到安装版\(names.count > 1 ? "（\(product)）" : " \(product)")正在运行，可能占用单实例锁或端口；如需切换到开发会话请手动退出它"
     }
 
     static func resolve(path: String, processes: [ProjectProcess], commands: [Int: String], directories: [Int: String],

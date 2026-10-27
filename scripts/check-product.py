@@ -15,9 +15,9 @@ with tempfile.TemporaryDirectory(prefix="DevBar product checks ") as folder:
     def run(arguments):
         print("Checking: " + " ".join(arguments), flush=True)
         subprocess.run(arguments, cwd=ROOT, env=env, check=True, timeout=240)
-    for flag in ("--self-test", "--self-test-auto-update", "--self-test-panel",
+    for flag in ("--self-test", "--self-test-panel",
                  "--self-test-menu-refresh"):
         run([str(BINARY), flag])
-    for script in ("verify_update_recovery.py", "verify_product_portability.py", "verify_distribution.py", "verify_sync.py"):
+    for script in ("verify_product_portability.py", "verify_distribution.py", "verify_sync.py"):
         run(["python3", "scripts/" + script])
 print("PASS: isolated product baseline (no publication or device acceptance)")

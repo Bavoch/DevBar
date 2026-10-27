@@ -72,7 +72,6 @@ with (root/'work/build-count').open('a') as f: f.write('build\\n')
         try: os.kill(pid, 0); return True
         except ProcessLookupError: return False
     def count(): return (project/'work/build-count').read_text().count('build')
-    watcher = None
     try:
         assert cli('sync', '--plan')['state'] == 'planned'
         assert not artifact.exists() and not (state/'sync').exists(), 'Plan must be read-only'
@@ -90,43 +89,6 @@ with (root/'work/build-count').open('a') as f: f.write('build\\n')
         pid2 = second['receipt']['pid']
         assert pid2 != pid and not alive(pid)
         assert json.loads(observed.read_text()) == {'pid': pid2, 'version': 'v2'}, 'Actual app must load new resource'
-        # Exercise the actual automatic worker against a windowless native app.
-        def watch():
-            return subprocess.Popen([BINARY, '--test-auto-update-project', str(project)], env=env,
-                                    stdout=(project/'work/auto.log').open('a'), stderr=subprocess.DEVNULL)
-        def wait_version(version, timeout=30):
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if observed.exists() and json.loads(observed.read_text())['version'] == version:
-                    status = subprocess.run([BINARY, 'status', str(project), '--json'], env=env, text=True, capture_output=True, timeout=10)
-                    if status.returncode == 0 and json.loads(status.stdout)['state'] == 'current': return
-                time.sleep(.3)
-            raise AssertionError((version, (project/'work/auto.log').read_text()))
-        watcher = watch()
-        for i in range(6):
-            source.write_text('auto-draft-' + str(i)); time.sleep(.6)
-        assert count() == 2, 'Continuous edits must not rebuild'
-        source.write_text('auto-v1')
-        wait_version('auto-v1')
-        assert cli('status')['state'] == 'current' and count() == 3
-        pid2 = json.loads(observed.read_text())['pid']
-        (project/'work/mode').write_text('fail')
-        source.write_text('auto-failed')
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and 'failed:' not in (project/'work/auto.log').read_text(): time.sleep(.3)
-        assert 'failed:' in (project/'work/auto.log').read_text(), 'Automatic failure must be visible'
-        assert alive(pid2) and json.loads(observed.read_text())['version'] == 'auto-v1'
-        watcher.terminate(); watcher.wait(timeout=5)
-        (project/'work/mode').unlink()
-        before_logs = len(list((state/'sync').glob('*.log')))
-        watcher = watch(); time.sleep(7)
-        assert len(list((state/'sync').glob('*.log'))) == before_logs, 'Restart must not retry failed source'
-        # Manual retry remains available, without recording a new baseline.
-        assert cli('sync')['state'] == 'current'
-        source.write_text('auto-v2'); wait_version('auto-v2')
-        watcher.terminate(); watcher.wait(timeout=5); watcher = None
-        pid2 = json.loads(observed.read_text())['pid']
-        print('PASS: real automatic native update after quiet period, continuous edits, actual new payload/PID, sync/status, failed build preserves app, failure survives monitor restart, manual retry and next change recovery')
         receipt = next((state/'sync').glob('*.json'))
         assert receipt.stat().st_mode & 0o777 == 0o600
         (installed/'Contents/Resources/version.txt').write_text('tampered')
@@ -192,8 +154,6 @@ with (root/'work/build-count').open('a') as f: f.write('build\\n')
         assert cli('sync', '--target', 'missing', expected=1)['state'] == 'setupRequired'
         print('PASS: real background native App v1→v2, idempotence, content/touch checks, process identity, build failure/timeout, source race, concurrency lock, crash rollback, stale PID, wrong identity, external path rejection, JSON/private logs; no browser or foreground window')
     finally:
-        if watcher is not None and watcher.poll() is None:
-            watcher.terminate(); watcher.wait(timeout=5)
         # Only stop the fixture executable in this isolated installation.
         result = subprocess.run(['pgrep', '-f', str(installed/'Contents/MacOS/Fixture')], capture_output=True, text=True)
         for value in result.stdout.split():

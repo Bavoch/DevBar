@@ -55,7 +55,6 @@ enum ProjectEditor {
                 continue
             }
             var result = SavedProject(id: original?.id ?? UUID().uuidString, name: name.stringValue, path: directory, command: command.stringValue)
-            if result.path == original?.path { result.autoUpdateTarget = original?.autoUpdateTarget }
             if result.command == original?.command { result.targetID = original?.targetID }
             return result
         }
