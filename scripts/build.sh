@@ -24,8 +24,8 @@ cat > "$stage/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.devbar.app</string>
 <key>CFBundleName</key><string>DevBar</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.14.1</string>
-<key>CFBundleVersion</key><string>31</string>
+<key>CFBundleShortVersionString</key><string>0.15.0</string>
+<key>CFBundleVersion</key><string>32</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

@@ -97,7 +97,9 @@ int main(int argc, char **argv) {
         print('PASS: control detects direct execution as a child of the GUI manager')
 
         output=base/'command';output.mkdir()
-        command=shlex.join([str(target/'Contents/MacOS/Fixture'),'probe',str(output)])
+        # 面板与开发会话拒绝把安装包当开发命令；用 .app 外的同一二进制副本走受管启动。
+        tool=project/'tool'; shutil.copy2(native,tool); os.chmod(tool,0o700)
+        command=shlex.join([str(tool),'probe',str(output)])
         ident=cli('--add-project',str(project),'--name','PermissionFixture','--command',command).stdout.strip()
         parent=run_manager(['--start-project',ident],output)
         probe=evidence(output,parent)
@@ -108,10 +110,10 @@ int main(int argc, char **argv) {
         print('PASS: saved command is a verified launchd job with child tracking and normal stop')
 
         output=base/'process';output.mkdir()
-        (project/'.devbar.json').write_text(json.dumps({'schemaVersion':1,'targets':{'service':{'strategy':'process','startCommand':shlex.join([str(target/'Contents/MacOS/Fixture'),'probe',str(output)]),'sourcePaths':['Info.plist'],'timeout':8}}}))
+        (project/'.devbar.json').write_text(json.dumps({'schemaVersion':1,'targets':{'service':{'strategy':'process','startCommand':shlex.join([str(tool),'probe',str(output)]),'sourcePaths':['Info.plist'],'timeout':8}}}))
         parent=run_manager(['sync',str(project),'--target','service','--json'],output)
         evidence(output,parent)
-        wait(lambda: json.loads(cli('status',str(project),'--target','service','--json',check=False).stdout).get('state')=='runningUnverified', 'process receipt missing')
+        wait(lambda: json.loads(cli('status',str(project),'--target','service','--json',check=False).stdout).get('state')=='current', 'development session missing')
         stopped=cli('stop',str(project),'--target','service','--json',check=False)
         assert stopped.returncode==0, (stopped.stdout,stopped.stderr)
         print('PASS: managed process/sync uses the system job backend')

@@ -122,6 +122,8 @@
                 "minLength": 1
               },
               "runtimeWitness": {
+                "description": "Deprecated in v2: ignored. process targets are development sessions and need no runtime witness.",
+                "deprecated": true,
                 "enum": [
                   "nodeHTTP", "nodeProcess", "nodeGraph",
                   "staticHTTP",

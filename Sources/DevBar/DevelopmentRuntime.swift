@@ -125,8 +125,9 @@ enum DevelopmentRuntime {
         try CommandExecution.stop(live, force: true)
     }
     static func run(path: String, command: String) throws {
+        // 命令合法性由调用方把关：面板入口在 ProjectRunner.start 校验；
+        // sync 的 .devbar.json 属显式配置，直接执行。
         let root = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        try validate(command, root: root)
         guard let identity = try ProcessTable.read(Int(getpid()))[Int(getpid())] else { throw failure("无法记录开发会话") }
         let file = stateURL(root.path)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])

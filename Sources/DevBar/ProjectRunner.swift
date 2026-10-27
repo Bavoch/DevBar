@@ -62,9 +62,9 @@ enum ProjectRunner {
         }
         try start(project, store: store)
     }
-    static func start(_ project: SavedProject, store: ProjectStore) throws {
+    static func start(_ project: SavedProject, store: ProjectStore, validated: Bool = true) throws {
         guard !project.command.isEmpty else { throw failure("请先设置启动命令") }
-        try DevelopmentRuntime.validate(project.command, root: URL(fileURLWithPath: project.path))
+        if validated { try DevelopmentRuntime.validate(project.command, root: URL(fileURLWithPath: project.path)) }
         if let target = ProjectProfiles.selected(project), project.command == target.command, let issue = TargetRuntime.environmentIssue(target) { throw failure(issue) }
         let previous = store.targetRun(project.id, targetID(project)) ?? store.run(project.id)
         if let previous, ProcessTable.active(previous, table: try ProcessTable.read()),

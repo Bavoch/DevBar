@@ -384,7 +384,7 @@ enum ManagedSync {
             variant.targetID = plan.target
             if saved == nil { try store.save(variant) }
             let recordID = saved?.id ?? variant.id
-            try ProjectRunner.start(variant, store: store)
+            try ProjectRunner.start(variant, store: store, validated: false)
             let deadline = Date().addingTimeInterval(15)
             while Date() < deadline {
                 if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true) {

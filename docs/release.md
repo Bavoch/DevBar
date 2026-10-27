@@ -14,7 +14,7 @@ DevBar 是原生 macOS 产品。本地开发构建与可公开分发的签名、
 |---|---|
 | 工程识别/配置/环境 | verify_profiles.py、verify_product_portability.py、audit_projects.py、doctor/inventory 的机器可读诊断 |
 | macOS 更新与恢复 | verify_sync.py：真实无窗口 App v1/v2，失败保留、并发、超时、启动失败恢复 |
-| Web/后台受管进程 | verify_runtime_sync.py：实际 HTTP 运行版本、旧实例退出、无探针不成功、独立宿主适配器 |
+| Web/后台开发会话 | 开发会话端到端（启动/幂等/源码变化自动重启/停止）见 verify_sync.py 与手验清单；v2 起 process 不再需要运行探针 |
 | 浏览器插件 | verify_extension_sync.py：实际无头 MV3 后台和无后台插件文档，更新、身份与内容核对 |
 | iOS 模拟器 | verify_ios_sync.py：真实构建/安装/更新，应用写出的运行版本/PID，与原生包内容比较 |
 | 原有生命周期 | verify_lifecycle.py、verify_freshness.py、verify_desktop.py、verify_entrypoints.py、verify_target_routes.py |
@@ -53,12 +53,8 @@ DevBar 是原生 macOS 产品。本地开发构建与可公开分发的签名、
 
 ## 自动接入回归
 
-- `verify_automatic_sync.py`：无配置 Node/静态页、精确文档、独立源码测量、编译端口排除、更新与停止。
 - `verify_group_sync.py` / `verify_compound_start.py`：组合成员、前置顺序、普通运行、全成员证据、失败清理与循环拒绝。
-- `verify_node_graph.py`：保留项目 ESM 编排和预检、Node + 实际 workerd、成员丢失失效。
-- `verify_node_process.py` / `verify_python_automatic.py`：实际入口加载、非 HTTP 作业输出 v1→v2、旧缓存与源码变化、独立停止。
-- `verify_worker_automatic.py`：项目/已安装 CLI、实际 workerd、原配置兼容标记/变量/静态资产路由、v1→v2。
-- `verify_swift_automatic.py` / `verify_frontend_adoption.py`：真实原生可执行文件、严格身份、保守外部接入与端口冲突。
+- `verify_python_automatic.py`：零配置 Python 项目走开发会话（启动/源码变化自动重启/停止）。
 - `accept_sync_plans.py` / `accept_automatic_projects.py` / `accept_group_project.py`：实际工程只读计划及按类隔离运行验收；计划通过不算真实应用验收。
 
 ## 开源协作与基础 CI

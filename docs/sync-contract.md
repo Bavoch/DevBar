@@ -1,4 +1,4 @@
-# 本地更新协议 v1
+# 本地更新协议 v2
 
 DevBar 是本地应用生命周期与运行版本证据的协调器。配置识别、环境就绪、运行中、版本一致、界面验收是不同状态。任意文件改动不触发无条件重启；AI 或用户在任务结束时显式调用统一命令。
 
@@ -20,21 +20,21 @@ devbar stop /path/to/project --target 更新目标ID --json
 
 多个同步目标必须显式选择 `--target`；单目标可以省略。未知命令、未知字段、适配器不适用字段、未来 schemaVersion 均拒绝执行。原有 `--sync-project`、`--sync-status` 及诊断参数兼容。
 
-JSON 包含 `schemaVersion: 1`。日期为 ISO 8601；私有存储属于内部格式。退出码 `0`：已验证 current、只读 planned 或成功配置；`1`：setupRequired、failed；`2`：busy、sourceChanged、artifactChanged、stopped、unconfirmed、runningUnverified、externalRuntime。`stop` 成功退出码为 0。doctor/inventory 的 ready 只表示该次诊断完成，不表示应用版本为 current。
+JSON 包含 `schemaVersion: 1`。日期为 ISO 8601；私有存储属于内部格式。退出码 `0`：已验证 current、只读 planned 或成功配置；`1`：setupRequired、failed；`2`：busy、sourceChanged、artifactChanged、stopped、unconfirmed、externalRuntime（runningUnverified 仅保留给缺少探针的 expo:ios）。process 目标的状态只有 current（会话运行中）/ failed（会话失败）/ externalRuntime（目录已有外部进程）/ busy。`stop` 成功退出码为 0。doctor/inventory 的 ready 只表示该次诊断完成，不表示应用版本为 current。
 
 ## 基础适配器
 
 | strategy | 生命周期 | current 必需的证据 |
 |---|---|---|
 | macBundle（兼容旧版省略 strategy） | 构建 → 暂存 → 优雅退出指定 App → 替换安装 → 新进程；失败恢复旧 App | 构建前后源码稳定，完整 App 哈希，新 PID/启动身份/路径/bundle identifier |
-| process | 构建（可选）→ 退出本目标的受管进程 → 启动前台运行命令 | 新进程、稳定源码、运行目标返回的版本与同步标识；缺探针只报告 runningUnverified |
+| process | 建立/复用「开发会话」：监视源码变化并自动重启（工具链自带 watch 时不重复干预，Flutter 走热重载）；会话存活即 current | 开发会话监督进程存活；无版本回执
 | extension | 构建（需要时）→ 重启专用浏览器会话 | 独立无头 Chromium 的真实插件后台或插件文档、插件身份、产物内容与新会话 |
 | iosSimulator | Xcode 构建/安装/启动到明确的模拟器 | 设备 UDID、bundle identifier、真实 PID、构建与已安装应用的完整内容 |
 | external | 显式 syncCommand → 专用只读 proofCommand | 设备、容器或宿主实际返回的版本、同步标识和实例身份 |
 
 macBundle 安装位置必须与产物分开，且不得相互嵌套、不得包含源码目录。已有安装目标必须同一 identifier。构建在停止原应用之前执行；不强制终止有未保存工作的 App。旧 App 保留到新实例通过检查，恢复失败会保留备份并返回路径。构建命令自身必须只负责构建，不能自行覆盖运行安装位置。
 
-process 的 startCommand 必须持续以前台命令运行，不能用 `&`、`nohup` 或 `open` 把服务脱离生命周期。只停止自身记录并验证身份的进程及后代，不按项目名杀进程，不结束日常浏览器或 AI。外部启动的同目录进程不会被静默接管。通用进程启动失败不保证源码回滚，返回 recovery 说明；构建失败发生在停止旧实例之前。
+process 的 startCommand 必须是持续以前台运行的 dev/watch 开发命令，不能用 `&`、`nohup` 或 `open` 脱离生命周期，也不能是构建预览或安装包启动。会话状态记录在数据目录 `development/`，进程身份以 launchd 任务记录（RunRecord）为唯一认领依据；不按项目名杀进程，不结束日常浏览器或 AI。目录中已有非 DevBar 启动的进程时返回 externalRuntime 提示，先手动停止再 sync，不做接管；同产品安装版与开发会话冲突时只在失败原因里提示，绝不代替用户退出应用。v2 起 process 目标不再执行前置构建、注入运行探针或写入受管回执；`runtimeWitness` 字段被容忍但已忽略。源码监视失败（项目过大等）只降级为“不监视、需手动重启”，不会终止开发命令。
 
 extension 只操作专用 Chromium / Chrome for Testing 资料目录，不更新用户日常浏览器中的插件，不把网页预览当作插件。Manifest V2 不冒充支持。后台需在浏览器实际运行并核对 runtime identity；无后台插件需实际加载插件文档。后续 status 检查同一浏览器实例和插件磁盘内容，不因合法的后台休眠而误报。
 
@@ -83,7 +83,7 @@ external 用于尚未实现内置驱动的框架、微信开发者工具和容�
 
 ## 运行版本探针
 
-更新与启动命令收到 `DEVBAR_SOURCE_DIGEST`、`DEVBAR_SYNC_ID`、`DEVBAR_SYNC_TARGET`。驱动应将版本标识关联到实际构建，并从运行中的应用、设备或宿主读取；不能只在验证脚本中回显这些环境变量，也不能用静态 JSON 伪造成功。
+非 process 目标的更新与启动命令收到 `DEVBAR_SOURCE_DIGEST`、`DEVBAR_SYNC_ID`、`DEVBAR_SYNC_TARGET`（process 开发会话不注入这些变量，也不再要求探针）。驱动应将版本标识关联到实际构建，并从运行中的应用、设备或宿主读取；不能只在验证脚本中回显这些环境变量，也不能用静态 JSON 伪造成功。`runtimeWitness` 及其配套注入（NODE_OPTIONS 预加载、witness 目录）已在 v2 移除。
 
 proofURL 直接返回 HTTP 200 与 JSON；不跟随跳转，不使用 Cookie 或系统凭据，只接受 localhost/127.0.0.1/::1，限制响应 1MB。proofCommand 只向 stdout 输出如下 JSON，stderr 单独记日志；收到 `DEVBAR_PROBE_ONLY=1`，不得构建、安装或启动目标。
 
@@ -104,7 +104,7 @@ proofURL 直接返回 HTTP 200 与 JSON；不跟随跳转，不使用 Cookie 或
 
 默认数据目录为当前用户 Application Support/DevBar，可用 `DEVBAR_DATA_DIR` 隔离。项目锁、安装位置锁防止并发互相覆盖；日志和同步记录仅当前用户可读写。不会在配置发现阶段执行命令。
 
-测试分别覆盖配置、真实受管 HTTP、独立宿主、实际插件加载、macOS 应用包替换与崩溃恢复、iOS 模拟器安装与应用自身写出的运行版本。屏幕视觉、真实手机、商店、生产部署、第三方宿主驱动和公证分别验收，不能用这些本地测试替代。
+测试分别覆盖配置、真实开发会话（启动/幂等/源码变化自动重启/停止）、独立宿主、实际插件加载、macOS 应用包替换与崩溃恢复、iOS 模拟器安装与应用自身写出的运行版本。会话状态与运行记录是私有内部格式。屏幕视觉、真实手机、商店、生产部署、第三方宿主驱动和公证分别验收，不能用这些本地测试替代。
 
 ## Built-in device and host drivers (0.11)
 
