@@ -87,8 +87,8 @@ enum DevelopmentRuntime {
 
     static func snapshot(_ root: URL) throws -> [String: String] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
-        var scanError: Error?
-        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, error in scanError = error; return false }) else {
+        // 目录级错误（权限、断链等）跳过该子树继续枚举，不让整次快照失败。
+        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in true }) else {
             throw failure("无法监听项目源码目录")
         }
         var result: [String: String] = [:]
@@ -110,10 +110,14 @@ enum DevelopmentRuntime {
             guard value.isRegularFile == true else { continue }
             let relative = String(file.path.dropFirst(root.path.count + 1))
             result[relative] = "\(value.fileSize ?? 0):\(value.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-            if result.count > 100_000 { throw failure("源码监听范围过大，请缩小到具体应用目录") }
+            if result.count > 200_000 { throw failure("源码监听范围过大，请缩小到具体应用目录") }
         }
-        if let scanError { throw scanError }
         return result
+    }
+
+    /// 监视只是会话的增强能力：快照失败时降级为不监视，绝不能因此终止开发命令。
+    static func safeSnapshot(_ root: URL) -> [String: String]? {
+        do { return try snapshot(root) } catch { return nil }
     }
     static func stopSession(_ path: String) throws {
         guard let session = TargetRuntime.session(path, targetOnly: true), let live = try ProcessTable.read(session.pid)[session.pid] else { return }
@@ -161,9 +165,16 @@ enum DevelopmentRuntime {
             else { task.standardInput = FileHandle.nullDevice }
             try task.run(); process = task
             child = try ProcessTable.read(Int(task.processIdentifier))[Int(task.processIdentifier)]
-            try record("watching", nativeWatcher ? "开发命令运行中；工具链负责监听，实际界面更新尚未核验" : "开发命令运行中；源码变化后自动重启，实际界面更新尚未核验")
+            let watchingReason: String
+            if nativeWatcher { watchingReason = "开发命令运行中；工具链负责监听，实际界面更新尚未核验" }
+            else if watchDisabled { watchingReason = "开发命令运行中；源码监视不可用（项目过大或读取失败），修改后请手动重启会话" }
+            else { watchingReason = "开发命令运行中；源码变化后自动重启，实际界面更新尚未核验" }
+            try record("watching", watchingReason)
         }
-        var baseline = try snapshot(root)
+        var watchDisabled: Bool
+        var baseline: [String: String]
+        if let initial = safeSnapshot(root) { baseline = initial; watchDisabled = false }
+        else { baseline = [:]; watchDisabled = true }
         var pending = baseline
         var changedAt: Date?
         try start()
@@ -176,12 +187,13 @@ enum DevelopmentRuntime {
                 var reason = "开发命令已退出（\(code)）；修改源码后自动重试，详情见日志"
                 if let hint = DesktopApplications.installedConflictHint(path: root.path) { reason += "；" + hint }
                 try record("failed", reason)
-                baseline = try snapshot(root); pending = baseline; changedAt = nil
+                if let refreshed = safeSnapshot(root) { baseline = refreshed } else { watchDisabled = true }
+                pending = baseline; changedAt = nil
             }
             // Do not duplicate a framework's filesystem watcher or continuously
             // traverse large projects while HMR is already managing changes.
-            if nativeWatcher && process != nil { continue }
-            let current = try snapshot(root)
+            if (nativeWatcher || watchDisabled) && process != nil { continue }
+            guard let current = safeSnapshot(root) else { watchDisabled = true; continue }
             if current != pending { pending = current; changedAt = Date() }
             guard let time = changedAt, Date().timeIntervalSince(time) >= 0.6 else { continue }
             changedAt = nil

@@ -256,7 +256,7 @@ private final class HeaderProbe: NSObject, URLSessionDataDelegate, @unchecked Se
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { ready.signal() }
 
-    func read(_ url: URL, method: String, timeout: Double = 0.65) -> HeaderResponse? {
+    func read(_ url: URL, method: String, timeout: Double = 1.5) -> HeaderResponse? {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
@@ -308,11 +308,12 @@ enum LocalWebProbe {
 
     static func inspect(_ listener: Listener) -> HTTPObservation {
         lock.lock(); let cached = cache[listener]; lock.unlock()
-        if let cached, Date().timeIntervalSince(cached.date) < (cached.result.kind == .unknown ? 2 : 5) { return cached.result }
+        if let cached, Date().timeIntervalSince(cached.date) < 5 { return cached.result }
         var result = HTTPObservation(kind: .unknown)
         for scheme in ["http", "https"] {
             let url = URL(string: "\(scheme)://localhost:\(listener.port)" + (listener.path ?? ""))!
-            guard var header = HeaderProbe().read(url, method: "HEAD") else { continue }
+            // 慢启动的服务首次可能来不及应答，无响应时立即补探一次。
+            guard var header = HeaderProbe().read(url, method: "HEAD") ?? HeaderProbe().read(url, method: "HEAD") else { continue }
             if [405, 501].contains(header.status), let fallback = HeaderProbe().read(url, method: "GET") { header = fallback }
             result = HTTPObservation(kind: classify(status: header.status, type: header.type, location: header.location), scheme: scheme,
                 htmlError: (500..<600).contains(header.status) && ["text/html", "application/xhtml+xml"].contains(header.type))
