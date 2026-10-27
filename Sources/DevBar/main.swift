@@ -1277,18 +1277,6 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
 } else if let path = cliValue("--develop-project"), let command = cliValue("--development-command") {
     do { try DevelopmentRuntime.run(path: path, command: command) }
     catch { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(1) }
-} else if let path = cliValue("--managed-start") {
-    do {
-        guard let target = cliValue("--target") else { throw failure("缺少运行目标") }
-        let output = MainActor.assumeIsolated {
-            NSApplication.shared.setActivationPolicy(.prohibited)
-            return SyncRouter.execute(action: "sync", path: path, target: target, planOnly: false)
-        }
-        print(output.0); fflush(stdout)
-        guard output.1 == 0 else { exit(output.1) }
-        while ManagedSync.active(path: path, target: target) { Thread.sleep(forTimeInterval: 0.5) }
-        exit(0)
-    } catch { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(1) }
 } else if ["sync", "status", "doctor", "inventory", "init", "stop"].contains(cliArguments.dropFirst().first ?? "") || cliArguments.contains("--sync-project") || cliArguments.contains("--sync-status") {
     let action = cliArguments.contains("--sync-status") ? "status" : cliArguments.contains("--sync-project") ? "sync" : cliArguments[1]
     let positional = cliArguments.count > 2 && !cliArguments[2].hasPrefix("-") ? cliArguments[2] : nil

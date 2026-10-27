@@ -42,7 +42,6 @@ struct ManagedReceipt: Codable {
     var proof: RuntimeProof?
     let syncID: String
     let completedAt: Date
-    var executionCommand: String? = nil
 }
 
 struct ManagedReport: Codable {
@@ -109,6 +108,12 @@ enum ManagedSync {
             return left < right
         }
         for key in keys {
+            if config.targets[key]?.strategy == "process" {
+                if let state = DevelopmentRuntime.state(root, target: key, exact: true), state.phase != "failed" {
+                    return RuntimeFreshness(state: .development, reason: state.reason)
+                }
+                continue
+            }
             guard belongs(stored(root, target: key)) else { continue }
             let value = status(path: root, target: key)
             if value.state == "current" { return RuntimeFreshness(state: .verified, reason: value.reason) }
@@ -125,6 +130,7 @@ enum ManagedSync {
             guard (try? GroupSync.validate(config, target: target)) != nil else { return false }
             return selected.members?.contains { active(path: path, target: $0) } == true
         }
+        if selected.strategy == "process" { return DevelopmentRuntime.state(path, target: target, exact: true) != nil }
         guard let receipt = stored(ProjectSync.canonical(path), target: target) else { return false }
         return receipt.process.map(CommandExecution.alive) ?? false
     }
@@ -135,6 +141,11 @@ enum ManagedSync {
         let config = try SyncRouter.configuration(path: root)
         guard let key = target ?? SyncRouter.singleTarget(path: root, configuration: config), let selected = config.targets[key] else { throw failure("请用 --target 指定已配置的同步目标") }
         if selected.strategy == "group" { return try MainActor.assumeIsolated { try GroupSync.execute(action: "stop", path: root, target: key, planOnly: false) } }
+        if selected.strategy == "process" {
+            guard DevelopmentRuntime.state(root, target: key, exact: true) != nil else { throw failure("没有可停止的开发会话") }
+            _ = try ProjectRunner.stop(path: root, store: ProjectStore(), targetID: key)
+            return try SyncRouter.encode(ManagedReport(state: "stopped", reason: "已停止开发会话", plan: try? plan(path: root, target: key)), state: "ready")
+        }
         guard selected.strategy != nil, selected.strategy != "macBundle" else { throw failure("应用包目标请使用 DevBar 的应用启停操作；stop 命令当前用于受管运行会话") }
         let fd = open(ProjectStore().directory.appendingPathComponent("sync/" + TargetRuntime.key(root) + ".lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw failure("此项目尚无同步记录") }; defer { close(fd) }
@@ -153,28 +164,7 @@ enum ManagedSync {
         guard timeout >= 5, timeout <= 3600, timeout.isFinite else { throw failure("timeout 必须为 5–3600 秒") }
         var launch = selected.launchTarget.flatMap { id in ProjectProfiles.profile(root).targets.first { $0.id == id } }
         if selected.launchTarget != nil, launch == nil { throw failure("launchTarget 已不存在，请重新选择运行方式") }
-        var command = selected.startCommand ?? launch?.command
-        if let mode = selected.runtimeWitness {
-            guard strategy == "process", ["nodeHTTP", "nodeProcess", "nodeGraph", "staticHTTP", "workerHTTP", "pythonProcess", "nativeBinary"].contains(mode), let launch else { throw failure("无效的自动运行核对目标") }
-            if ["staticHTTP", "workerHTTP", "pythonProcess"].contains(mode), selected.startCommand != nil { throw failure("此自动运行核对方式不能覆盖自定义 startCommand；请使用应用自己的版本探针") }
-            if mode == "nativeBinary" {
-                guard let artifact = selected.artifact, let executable = selected.executable,
-                      ProjectSync.canonical(executable, root: root).hasPrefix(ProjectSync.canonical(artifact, root: root) + "/") else { throw failure("原生程序需要项目内明确的构建产物与可执行文件") }
-            }
-            if mode == "pythonProcess" {
-                guard let entry = launch.script, let source = launch.container else { throw failure("缺少 Python 声明的入口") }
-                let python = URL(fileURLWithPath: launch.directory).appendingPathComponent(".venv/bin/python").path
-                let interpreter = fm.isExecutableFile(atPath: python) ? ProjectProfiles.quote(python) : "uv run python"
-                command = "cd " + ProjectProfiles.quote(launch.directory) + " && " + interpreter + " " + ProjectProfiles.quote(try AutomaticSync.resource("python-runtime.py")) + " " + ProjectProfiles.quote(entry) + " " + ProjectProfiles.quote(String(launch.id.split(separator: ":").last ?? "")) + " " + ProjectProfiles.quote(source)
-            }
-            if mode == "workerHTTP" {
-                command = "node " + ProjectProfiles.quote(try AutomaticSync.resource("worker-runtime.cjs")) + " " + ProjectProfiles.quote(launch.directory) + " " + ProjectProfiles.quote(launch.id)
-            }
-            if mode == "staticHTTP" {
-                guard launch.kind == .staticWeb, let page = launch.container else { throw failure("缺少静态网页入口") }
-                command = "python3 -B " + ProjectProfiles.quote(try AutomaticSync.resource("static-runtime.py")) + " " + ProjectProfiles.quote(launch.directory) + " " + ProjectProfiles.quote(page)
-            }
-        }
+        let command = selected.startCommand ?? launch?.command
         if strategy == "process", command?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false { throw failure("process 适配器需要前台 startCommand 或 launchTarget") }
         if strategy == "extension", launch?.kind != .browserExtension { throw failure("extension 适配器需要 browserExtension 类型的 launchTarget") }
         if strategy == "iosSimulator", launch?.kind != .ios || launch?.container == nil && launch?.id != "expo:ios" { throw failure("iosSimulator 适配器需要可确认的 Xcode／Expo 模拟器 launchTarget") }
@@ -235,30 +225,10 @@ enum ManagedSync {
     }
 
     private static func environment(_ plan: ManagedPlan, digest: String, id: String) -> [String: String] {
-        var value = ["DEVBAR_SOURCE_DIGEST": digest, "DEVBAR_SYNC_ID": id, "DEVBAR_SYNC_TARGET": plan.target, "DEVBAR_PROJECT_PATH": plan.project, "DEVBAR_HEADLESS": "1", "BROWSER": "none"]
-        if plan.configuration.runtimeWitness != nil {
-            value["DEVBAR_WITNESS_MODE"] = plan.configuration.runtimeWitness
-            value["DEVBAR_WITNESS_DIRECTORY"] = AutomaticSync.witnessDirectory(plan.project, id: id).path
-            if let preview = plan.launch?.previewPath { value["DEVBAR_WITNESS_ENTRY_PATH"] = preview }
-            value["DEVBAR_WITNESS_BINARY"] = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
-            if ["nodeHTTP", "nodeProcess", "nodeGraph"].contains(plan.configuration.runtimeWitness), let preload = try? AutomaticSync.resource("node-runtime.cjs") {
-                value["NODE_OPTIONS"] = (ProcessInfo.processInfo.environment["NODE_OPTIONS"] ?? "") + " --require \"" + preload.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
-            }
-        }
-        return value
+        ["DEVBAR_SOURCE_DIGEST": digest, "DEVBAR_SYNC_ID": id, "DEVBAR_SYNC_TARGET": plan.target, "DEVBAR_PROJECT_PATH": plan.project, "DEVBAR_HEADLESS": "1", "BROWSER": "none"]
     }
 
     private static func proof(_ plan: ManagedPlan, digest: String, id: String, process: LiveProcess? = nil) throws -> RuntimeProof? {
-        if plan.configuration.runtimeWitness == "nativeBinary" {
-            guard let process, let live = try ProcessTable.read(process.pid)[process.pid], live.uid == Int(getuid()), live.signature == process.signature,
-                  let executable = plan.configuration.executable, let artifact = plan.configuration.artifact,
-                  ProjectSync.canonical(live.executable) == ProjectSync.canonical(executable, root: plan.project) else { throw failure("等待本次构建的原生程序实际运行") }
-            let measured = try source(plan)
-            guard measured == digest else { throw failure("原生程序启动期间源码变化") }
-            let hash = try artifactHash(ProjectSync.canonical(artifact, root: plan.project), strategy: plan.strategy)
-            return RuntimeProof(sourceDigest: measured, syncID: id, target: plan.target, instanceID: "\(live.pid):\(live.signature)", runtimeVersion: "nativeBinary", pid: live.pid, artifactDigest: hash)
-        }
-        if plan.configuration.runtimeWitness != nil { return try AutomaticSync.proof(plan, digest: digest, id: id) }
         let data: Data
         if let command = try NativeDrivers.strategies.contains(plan.strategy) ? NativeDrivers.command(plan, action: "status") : plan.configuration.proofCommand {
             let folder = ProjectStore().directory.appendingPathComponent("sync/probes")
@@ -330,7 +300,6 @@ enum ManagedSync {
     }
 
     private static func stop(_ receipt: ManagedReceipt) throws {
-        if receipt.plan.configuration.runtimeWitness == "nodeGraph" { try AutomaticSync.stopGraph(receipt.plan.project, id: receipt.syncID) }
         if NativeDrivers.strategies.contains(receipt.plan.strategy) {
             let log = ProjectStore().directory.appendingPathComponent("sync/native-stop.log")
             try CommandExecution.run(command: NativeDrivers.command(receipt.plan, action: "stop"), directory: receipt.plan.project, log: log, environment: [:], timeout: 90)
@@ -341,22 +310,20 @@ enum ManagedSync {
             _ = try iosArtifact(session)
             _ = try TargetRuntime.run("/usr/bin/xcrun", ["simctl", "terminate", device, bundle], capture: true)
         }
-        if let process = receipt.process {
-            if receipt.plan.configuration.runtimeWitness == "nativeBinary", CommandExecution.alive(process),
-               let app = NSRunningApplication(processIdentifier: pid_t(process.pid)), app.activationPolicy != .prohibited {
-                guard app.terminate() else { throw failure("原生应用未同意退出，已保留原实例") }
-                let deadline = Date().addingTimeInterval(8)
-                while CommandExecution.alive(process), Date() < deadline { CommandExecution.pump() }
-                guard !CommandExecution.alive(process) else { throw failure("原生应用未同意退出，已保留原实例") }
-            } else { try CommandExecution.stop(process) }
-        }
-        if receipt.plan.configuration.runtimeWitness != nil {
-            try? fm.removeItem(at: AutomaticSync.witnessDirectory(receipt.plan.project, id: receipt.syncID))
-        }
+        if let process = receipt.process { try CommandExecution.stop(process) }
     }
 
     static func status(path: String, target: String) -> ManagedReport {
         let root = ProjectSync.canonical(path)
+        // process 目标以「开发会话」为事实源：会话存活即最新，退出即失败，无回执。
+        if (try? SyncRouter.configuration(path: root))?.targets[target]?.strategy == "process" {
+            let current = try? plan(path: root, target: target)
+            if let state = DevelopmentRuntime.state(root, target: target, exact: true) {
+                let mapped: String = state.phase == "failed" ? "failed" : "current"
+                return ManagedReport(state: mapped, reason: state.phase == "failed" ? state.reason : "开发会话运行中；" + state.reason, plan: current)
+            }
+            return ManagedReport(state: "stopped", reason: "开发会话未运行", plan: current)
+        }
         guard var receipt = stored(root, target: target) else { return ManagedReport(state: "unconfirmed", reason: "尚无此目标的运行版本证据") }
         func result(_ state: String, _ reason: String) -> ManagedReport { ManagedReport(state: state, reason: reason, plan: receipt.plan, receipt: receipt) }
         do {
@@ -373,7 +340,7 @@ enum ManagedSync {
             if let oldProof = receipt.proof {
                 guard let value = try proof(current, digest: receipt.sourceDigest, id: receipt.syncID, process: receipt.process), value.instanceID == oldProof.instanceID else { return result("unconfirmed", "运行版本探针不一致") }
                 receipt.proof = value
-            } else if current.strategy == "process" || current.launch?.id == "expo:ios" { return result("runningUnverified", "进程已启动；缺少运行版本探针，不能确认界面或应用已加载最新代码") }
+            } else if current.launch?.id == "expo:ios" { return result("runningUnverified", "进程已启动；缺少运行版本探针，不能确认界面或应用已加载最新代码") }
             return result("current", "源码范围、目标实例及适配器运行证据一致；未验收界面和业务流程")
         } catch { return result("unconfirmed", error.localizedDescription) }
     }
@@ -393,14 +360,53 @@ enum ManagedSync {
         } || found.session.map { !siblingPIDs.contains($0.pid) } == true
     }
 
+    /// process 目标统一走「开发会话」模型：会话自带源码监视与自动重启，
+    /// sync 只负责确保会话按当前配置在运行；不再做一次性冷启动与版本回执。
+    private static func sessionSync(_ plan: ManagedPlan) -> ManagedReport {
+        do {
+            if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true), state.phase != "failed" {
+                return ManagedReport(state: "current", reason: state.reason.isEmpty ? "开发会话已在运行" : state.reason, plan: plan)
+            }
+            let store = ProjectStore()
+            // DevBar 记录在案但监督进程已消失的运行，按记录安全清理后再判断。
+            if (try? store.load())?.contains(where: { $0.path == plan.project }) == true {
+                _ = try? ProjectRunner.stop(path: plan.project, store: store, targetID: plan.target)
+            }
+            // 只提示不动手：目录里已有非 DevBar 启动的进程时，拒绝建立会话。
+            if let found = try Discovery.scan(knownPaths: [plan.project]).first(where: { $0.path == plan.project }),
+               found.processes.contains(where: \.canStop) || found.session != nil {
+                return ManagedReport(state: "externalRuntime", reason: "此目录已有外部运行的进程；未结束或接管它们。请先手动停止，再由 sync 建立开发会话。", plan: plan)
+            }
+            guard let command = plan.startCommand else { throw failure("process 适配器需要前台 startCommand 或 launchTarget") }
+            let saved = (try store.load()).first(where: { $0.path == plan.project })
+            var variant = saved ?? SavedProject(name: URL(fileURLWithPath: plan.project).lastPathComponent, path: plan.project, command: command)
+            variant.command = command
+            variant.targetID = plan.target
+            if saved == nil { try store.save(variant) }
+            let recordID = saved?.id ?? variant.id
+            try ProjectRunner.start(variant, store: store)
+            let deadline = Date().addingTimeInterval(15)
+            while Date() < deadline {
+                if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true) {
+                    if state.phase == "failed" { return ManagedReport(state: "failed", reason: state.reason, plan: plan) }
+                    if state.phase != "starting" { return ManagedReport(state: "current", reason: "开发会话已启动；" + state.reason, plan: plan) }
+                } else if let run = store.targetRun(recordID, plan.target), run.exitCode != nil {
+                    return ManagedReport(state: "failed", reason: "开发会话监督进程已退出（退出码 \(run.exitCode.map(String.init) ?? "?")）；详情见日志", plan: plan)
+                }
+                CommandExecution.pump(0.2)
+            }
+            return ManagedReport(state: "current", reason: "开发会话已启动并仍在初始化；当前状态请用 status 查询", plan: plan)
+        } catch {
+            return ManagedReport(state: "failed", reason: error.localizedDescription, plan: plan)
+        }
+    }
+
     static func sync(path: String, target: String, planOnly: Bool) -> ManagedReport {
         var selected: ManagedPlan?
         var log: URL?
         var started: LiveProcess?
         var launchedSession: TargetSession?
         var oldStopped = false
-        var executionCommand: String?
-        var attemptID: String?
         do {
             let plan = try self.plan(path: path, target: target); selected = plan
             if planOnly { return ManagedReport(state: "planned", reason: "只读计划；不会执行脚本、安装、启动或探针命令", plan: plan) }
@@ -409,35 +415,10 @@ enum ManagedSync {
             let fd = open(folder.appendingPathComponent(TargetRuntime.key(plan.project) + ".lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw failure("无法锁定项目") }; defer { close(fd) }
             guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return ManagedReport(state: "busy", reason: "项目正在同步", plan: plan) }; defer { flock(fd, LOCK_UN) }
+            if plan.strategy == "process" { return sessionSync(plan) }
             let existing = status(path: plan.project, target: target)
             if ["current", "runningUnverified"].contains(existing.state) { return existing }
             var previous = stored(plan.project, target: target)
-            // 本次受管启动自身的 run 记录指向当前进程的祖先（launchd wrapper）；
-            // 接管它会让 stop 对整个进程组发信号，连同自己一起终止。
-            var lineage: Set<Int> = [Int(getpid())]
-            var lineageCursor = Int(getpid())
-            while let step = try? ProcessTable.read(lineageCursor)[lineageCursor], step.parent > 1, !lineage.contains(step.parent) {
-                lineageCursor = step.parent
-                lineage.insert(lineageCursor)
-            }
-            if previous == nil, plan.strategy != "external", !NativeDrivers.strategies.contains(plan.strategy),
-               let saved = try ProjectStore().load().first(where: { $0.path == plan.project && $0.command == plan.startCommand }),
-               let run = ProjectStore().runs(saved.id).first(where: { $0.targetID == nil || $0.targetID == ProjectRunner.targetID(saved) }), let live = try ProcessTable.read(run.pid)[run.pid],
-               live.pid != Int(getpid()), !lineage.contains(live.pid), live.signature == run.signature, live.uid == Int(getuid()), live.group == live.pid {
-                // A matching launch record belongs to DevBar, unlike an arbitrary external process.
-                let session = TargetRuntime.session(plan.project).flatMap { value -> TargetSession? in
-                    guard let launch = plan.launch, ["extension", "iosSimulator"].contains(plan.strategy), value.kind == launch.kind,
-                          value.targetID == launch.id || launch.id.hasSuffix(":" + value.targetID) else { return nil }
-                    return value
-                }
-                previous = ManagedReceipt(plan: plan, sourceDigest: "", artifactPath: nil, artifactDigest: nil, process: live,
-                                          session: session, proof: nil, syncID: "adopted-lifecycle-only", completedAt: Date())
-            }
-            if previous?.process.map(CommandExecution.alive) != true,
-               let found = try Discovery.scan(knownPaths: [plan.project]).first(where: { $0.path == plan.project }),
-               let process = try AutomaticSync.adoptable(plan, project: found) {
-                previous = ManagedReceipt(plan: plan, sourceDigest: "", artifactPath: nil, artifactDigest: nil, process: process, session: nil, proof: nil, syncID: "verified-external-lifecycle", completedAt: Date())
-            }
             let siblingPIDs = try otherManagedPIDs(plan.project)
             // Do not silently take ownership of independently started targets or their sibling services.
             if plan.strategy != "external", !NativeDrivers.strategies.contains(plan.strategy), previous?.process.map(CommandExecution.alive) != true,
@@ -447,7 +428,6 @@ enum ManagedSync {
             }
             let sourceDigest = try source(plan)
             let id = UUID().uuidString
-            attemptID = id
             let env = environment(plan, digest: sourceDigest, id: id)
             log = folder.appendingPathComponent("managed-" + id + ".log")
             if let command = plan.buildCommand { try CommandExecution.run(command: command, directory: plan.project, log: log!, environment: env, timeout: plan.timeout) }
@@ -476,12 +456,6 @@ enum ManagedSync {
                 while Date() < deadline {
                     guard let process = started else { throw failure("启动命令不存在") }
                     if !CommandExecution.alive(process) {
-                        let output = (try? String(contentsOf: log!, encoding: .utf8)) ?? ""
-                        if executionCommand == nil, let fallback = AutomaticSync.fallbackCommand(plan), ["EADDRINUSE", "already in use", "address in use"].contains(where: output.contains) {
-                            executionCommand = fallback
-                            started = try CommandExecution.spawn(command: fallback, directory: plan.project, log: log!, environment: env)
-                            continue
-                        }
                         throw failure("启动命令已退出，请查看日志")
                     }
                     do {
@@ -520,18 +494,13 @@ enum ManagedSync {
             if artifactPath == nil, let artifact = plan.configuration.artifact {
                 artifactPath = ProjectSync.canonical(artifact, root: plan.project); artifactDigest = try artifactHash(artifactPath!, strategy: plan.strategy)
             }
-            var receipt = ManagedReceipt(plan: plan, sourceDigest: sourceDigest, artifactPath: artifactPath, artifactDigest: artifactDigest,
+            let receipt = ManagedReceipt(plan: plan, sourceDigest: sourceDigest, artifactPath: artifactPath, artifactDigest: artifactDigest,
                                          process: started, session: launchedSession, proof: verifiedProof, syncID: id, completedAt: Date())
-            receipt.executionCommand = executionCommand
             try ProjectStore().write(receipt, to: file(plan.project, target: target))
-            let state = (plan.strategy == "process" || plan.launch?.id == "expo:ios") && verifiedProof == nil ? "runningUnverified" : "current"
+            let state = plan.launch?.id == "expo:ios" && verifiedProof == nil ? "runningUnverified" : "current"
             return ManagedReport(state: state, reason: state == "current" ? "已更新并核对目标运行证据；未验收界面和业务流程" : "受管进程已启动；请配置 proofURL 或 proofCommand 后再确认最新运行版本", plan: plan, receipt: receipt, log: log?.path)
         } catch {
             var recovery: String? = oldStopped ? "原实例已停止；通用运行命令无法保证回滚源码，请修复后重新 sync。" : nil
-            if let plan = selected, plan.configuration.runtimeWitness == "nodeGraph", let id = attemptID {
-                do { try AutomaticSync.stopGraph(plan.project, id: id) }
-                catch { recovery = "组合子进程清理失败：" + error.localizedDescription }
-            }
             if let started {
                 do {
                     if let session = launchedSession, session.kind == .ios, let device = session.device, let bundle = session.bundleID { _ = try? TargetRuntime.run("/usr/bin/xcrun", ["simctl", "terminate", device, bundle], capture: true) }
