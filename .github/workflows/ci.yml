@@ -1,0 +1,22 @@
+name: Product checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build self-contained development app
+        run: zsh scripts/build.sh
+      - name: Check product without foreground windows
+        run: python3 scripts/check-product.py

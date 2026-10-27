@@ -1,0 +1,705 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devbar:sync-configuration:1",
+  "title": "DevBar local sync configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "targets"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1,
+      "default": 1
+    },
+    "targets": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "const": "macBundle"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "installPath": {
+                "type": "string",
+                "minLength": 1
+              },
+              "bundleIdentifier": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 3600
+              }
+            },
+            "required": [
+              "buildCommand",
+              "artifact",
+              "installPath"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "const": "process"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 3600
+              },
+              "startCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "launchTarget": {
+                "type": "string",
+                "minLength": 1
+              },
+              "proofURL": {
+                "type": "string",
+                "format": "uri"
+              },
+              "proofCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "runtimeWitness": {
+                "enum": [
+                  "nodeHTTP", "nodeProcess", "nodeGraph",
+                  "staticHTTP",
+                  "workerHTTP",
+                  "pythonProcess",
+                  "nativeBinary"
+                ]
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "strategy"
+            ],
+            "anyOf": [
+              {
+                "required": [
+                  "startCommand"
+                ]
+              },
+              {
+                "required": [
+                  "launchTarget"
+                ]
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "const": "extension"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 3600
+              },
+              "launchTarget": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "launchTarget",
+              "strategy"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "const": "iosSimulator"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 3600
+              },
+              "launchTarget": {
+                "type": "string",
+                "minLength": 1
+              },
+              "proofURL": {
+                "type": "string",
+                "format": "uri"
+              },
+              "proofCommand": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "launchTarget",
+              "strategy"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "const": "external"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 3600
+              },
+              "proofCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "syncCommand": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "syncCommand",
+              "proofCommand",
+              "strategy"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "artifact",
+              "device",
+              "bundleIdentifier",
+              "activity"
+            ],
+            "properties": {
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              },
+              "strategy": {
+                "const": "androidDevice"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "device": {
+                "type": "string",
+                "minLength": 1
+              },
+              "bundleIdentifier": {
+                "type": "string",
+                "minLength": 1
+              },
+              "activity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "runtimeProofPath": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "artifact",
+              "device",
+              "bundleIdentifier"
+            ],
+            "properties": {
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              },
+              "strategy": {
+                "const": "iosDevice"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "device": {
+                "type": "string",
+                "minLength": 1
+              },
+              "bundleIdentifier": {
+                "type": "string",
+                "minLength": 1
+              },
+              "runtimeProofPath": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "entry"
+            ],
+            "properties": {
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              },
+              "strategy": {
+                "const": "blender"
+              },
+              "entry": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hostExecutable": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "entry"
+            ],
+            "properties": {
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              },
+              "strategy": {
+                "const": "omp"
+              },
+              "entry": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hostExecutable": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "artifact",
+              "host",
+              "remoteStage",
+              "remoteArtifact",
+              "installPath",
+              "executable",
+              "proofURL"
+            ],
+            "properties": {
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              },
+              "strategy": {
+                "const": "windowsSSH"
+              },
+              "buildCommand": {
+                "type": "string",
+                "minLength": 1
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "remoteStage": {
+                "type": "string",
+                "minLength": 1
+              },
+              "remoteArtifact": {
+                "type": "string",
+                "minLength": 1
+              },
+              "installPath": {
+                "type": "string",
+                "minLength": 1
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "proofURL": {
+                "type": "string",
+                "minLength": 1
+              },
+              "launchMode": {
+                "enum": [
+                  "interactive",
+                  "background"
+                ],
+                "default": "background"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "entry",
+              "hostExecutable"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "dsh"
+              },
+              "entry": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hostExecutable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "browserExecutable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "composeFile",
+              "service",
+              "projectName",
+              "proofURL"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "dockerCompose"
+              },
+              "composeFile": {
+                "type": "string",
+                "minLength": 1
+              },
+              "service": {
+                "type": "string",
+                "minLength": 1
+              },
+              "projectName": {
+                "type": "string",
+                "minLength": 1
+              },
+              "dockerContext": {
+                "type": "string",
+                "minLength": 1
+              },
+              "proofURL": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sourcePaths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 30,
+                "maximum": 3600
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "strategy",
+              "members"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "group"
+              },
+              "members": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

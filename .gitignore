@@ -1,0 +1,15 @@
+.build/
+dist/
+work/
+.DS_Store
+out/
+.playwright-cli/
+.v2c/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.mobileprovision

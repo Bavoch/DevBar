@@ -1,0 +1,24 @@
+#!/bin/zsh
+set -euo pipefail
+root="${0:A:h:h}"
+if [[ $# -eq 0 || "$1" == help || "$1" == --help || "$1" == -h ]]; then
+  print '用法：devbar sync|status|doctor|inventory|init|stop 项目目录 [--target ID] [--json] [--plan]'
+  print 'devbar --version 显示当前 CLI 所属应用的版本。'
+  print 'init 默认只展示配置草稿，--write 才创建配置；doctor 和 inventory 只读。'
+  print 'sync 根据项目 .devbar.json 更新并核对运行版本；status 只读核对。'
+  if [[ -f "${0:A:h}/docs/sync-contract.md" ]]; then print "协议：${0:A:h}/docs/sync-contract.md"; fi
+  exit 0
+fi
+bundled="${0:A:h}/../MacOS/DevBar"
+if [[ -x "$bundled" ]]; then
+  exec "$bundled" "$@"
+fi
+case "$1" in
+  sync|status|doctor|inventory|init|stop|version|--*) ;;
+  *) print -u2 "未知命令：$1"; exit 1 ;;
+esac
+if [[ -x "$root/.build/release/DevBar" ]]; then
+  exec "$root/.build/release/DevBar" "$@"
+fi
+print -u2 'DevBar 尚未构建，请先执行 zsh scripts/build.sh'
+exit 1
