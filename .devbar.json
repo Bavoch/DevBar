@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "dev": {
+      "strategy": "process",
+      "startCommand": "swift build && exec .build/debug/DevBar",
+      "sourcePaths": ["Sources", "Package.swift", "drivers"],
+      "timeout": 120
+    }
+  }
+}

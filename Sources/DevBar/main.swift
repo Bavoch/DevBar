@@ -467,16 +467,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         popover.animates = false
         popover.appearance = NSAppearance(named: .darkAqua)
         popover.delegate = self
-        panel.add.invoke = { [weak self] in self?.addProject() }
-        panel.refresh.invoke = { [weak self] in self?.refresh() }
-        panel.more.invoke = { [weak self] in
+        panel.onAdd = { [weak self] in self?.addProject() }
+        panel.onRefresh = { [weak self] in self?.refresh() }
+        panel.onMoreMenu = { [weak self] anchor in
             guard let self else { return }
             let options = NSMenu()
             self.add("关于 DevBar…", action: #selector(self.showAbout), to: options)
             self.add("使用帮助", action: #selector(self.showHelp), to: options)
             options.addItem(.separator())
             self.add("退出 DevBar", action: #selector(self.quit), to: options).keyEquivalent = "q"
-            options.popUp(positioning: nil, at: NSPoint(x: 0, y: 34), in: self.panel.more)
+            options.popUp(positioning: nil, at: NSPoint(x: 0, y: 34), in: anchor)
         }
         panel.onResize = { [weak self] size in self?.popover.contentSize = size }
         panel.onClose = { [weak self] in self?.popover.performClose(nil) }
@@ -1472,7 +1472,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
         exit(1)
     }
 } else if CommandLine.arguments.contains("--self-test-freshness") {
-    try RuntimeFreshnessInspector.verify()
+    RuntimeFreshnessInspector.verify()
 } else if CommandLine.arguments.contains("--self-test-dismissal") {
     MainActor.assumeIsolated {
         NSApplication.shared.setActivationPolicy(.prohibited)
