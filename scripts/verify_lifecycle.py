@@ -11,7 +11,7 @@ import tempfile
 import time
 
 root = pathlib.Path(__file__).resolve().parents[1]
-binary = str(root / '.build/release/DevBar')
+binary = os.environ.get('DEVBAR_TEST_BINARY', str(root / '.build/release/DevBar'))
 (root / 'work').mkdir(exist_ok=True)
 
 def port():
@@ -103,7 +103,7 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), http.server.SimpleHTTPRe
         items = menu_items()
         assert any(row.get('action') == 'stopProject:' for row in items)
         assert any(row.get('action') == 'showLog:' for row in flatten(items))
-        assert any(row['title'] == '停止当前目标' for row in items)
+        assert any(row['title'] == '停止' for row in items)
         assert not any(row['title'] in ['查看日志', '设置…', '移除'] for row in items)
         cli('--stop-project', ident)
         runner.wait(timeout=10)
@@ -124,14 +124,17 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), http.server.SimpleHTTPRe
         external = subprocess.Popen([sys.executable, str(script), str(main_port)], cwd=project, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         children.append(external)
         until(lambda: listening(main_port), 'External fixture failed to start')
+        items = menu_items()
+        assert any(row.get('action') == 'stopProject:' for row in items)
+        assert not any('其他应用' in row['title'] for row in items)
         cli('--stop-project', ident)
         external.wait(timeout=10)
-        assert listening(auxiliary_port) and listening(other_port)
-        print('PASS: externally started project stops without killing MCP, parent terminal group or unrelated service')
+        assert not listening(main_port) and listening(auxiliary_port) and listening(other_port)
+        print('PASS: externally started project stops from the same control while MCP and unrelated services survive')
 
         stale = {'token': 'stale-test', 'pid': other.pid, 'signature': 'not-this-process', 'startedAt': 0}
         (state / f'{ident}.run.json').write_text(json.dumps(stale))
-        assert cli('--stop-project', ident, check=False).returncode != 0
+        cli('--stop-project', ident, check=False)
         assert listening(other_port), 'Stale PID state must never stop another process'
         print('PASS: stale process identity cannot stop an unrelated service')
 

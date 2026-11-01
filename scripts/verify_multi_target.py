@@ -18,7 +18,9 @@ with tempfile.TemporaryDirectory(prefix='DevBar targets ', dir=root / 'work') as
     (project / 'index.html').write_text('multi-target fixture')
     env = dict(os.environ, DEVBAR_DATA_DIR=str(base / 'state'))
     def cli(*args, check=True):
-        return subprocess.run([binary, *args], env=env, capture_output=True, text=True, check=check, timeout=45)
+        result = subprocess.run([binary, *args], env=env, capture_output=True, text=True, timeout=45)
+        if check: assert result.returncode == 0, result.stdout + result.stderr
+        return result
     def ready(port):
         try:
             return urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=.5).status == 200
@@ -35,6 +37,13 @@ with tempfile.TemporaryDirectory(prefix='DevBar targets ', dir=root / 'work') as
         cli('--start-project', ident, '--target', 'dev'); until(lambda: ready(ports[0]))
         cli('--start-project', ident, '--target', 'dev:backend'); until(lambda: ready(ports[1]))
         assert ready(ports[0]) and ready(ports[1])
+        previous = {json.loads(file.read_text())['targetID']: json.loads(file.read_text())['pid']
+                    for file in (base/'state').glob(ident+'.target-*.run.json')}
+        cli('--restart-project', ident)
+        until(lambda: ready(ports[0]) and ready(ports[1]))
+        restarted = {json.loads(file.read_text())['targetID']: json.loads(file.read_text())['pid']
+                     for file in (base/'state').glob(ident+'.target-*.run.json')}
+        assert restarted.keys() == previous.keys() and all(restarted[key] != previous[key] for key in previous), 'Project restart lost or reused a running target'
         assert cli('--start-project', ident, '--target', 'dev', check=False).returncode != 0
         assert cli('--stop-project', ident, check=False).returncode != 0
         cli('--stop-project', ident, '--target', 'dev'); until(lambda: not ready(ports[0]))

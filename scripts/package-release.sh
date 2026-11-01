@@ -11,10 +11,10 @@ if [[ "${1:-}" == --notarize && -z "${DEVBAR_NOTARY_PROFILE:-}" ]]; then
   print -u2 '公证需要已配置的 DEVBAR_NOTARY_PROFILE Keychain profile。'; exit 1
 fi
 zsh scripts/build.sh
-python3 scripts/verify_distribution.py
-DEVBAR_TEST_BINARY="$PWD/dist/DevBar.app/Contents/MacOS/DevBar" python3 scripts/verify_permission_ownership.py
+python3 scripts/check-product.py
 version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/DevBar.app/Contents/Info.plist)"
 architecture="$(uname -m)"
+codesign --verify --deep --strict dist/DevBar.app
 archive="$PWD/dist/DevBar-$version-$architecture.zip"
 ditto -c -k --keepParent dist/DevBar.app "$archive"
 if [[ "${1:-}" == --notarize ]]; then

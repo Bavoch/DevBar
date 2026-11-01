@@ -22,7 +22,9 @@ with tempfile.TemporaryDirectory(prefix='Product diagnostics ',dir=ROOT/'work') 
     (app/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':'local.devbar.draft','CFBundleExecutable':'Example'}))
     (app/'MacOS/Example').write_text('#!/bin/sh\nexit 0\n');(app/'MacOS/Example').chmod(0o755)
     draft=cli('init',project,'--target','swift','--plan')
-    assert draft['configuration']['targets']['swift']['strategy']=='macBundle'
+    assert draft['configuration']['targets']['swift']['strategy']=='process'
+    assert draft['configuration']['targets']['swift']['launchTarget']=='swift'
+    assert 'installPath' not in draft['configuration']['targets']['swift']
     assert cli('sync',project,'--target','swift','--plan')['state']=='planned'
     assert not (project/'MUST_NOT_RUN').exists() and not (project/'.devbar.json').exists()
     workspace=base/'Workspace'
@@ -46,4 +48,4 @@ with tempfile.TemporaryDirectory(prefix='Product diagnostics ',dir=ROOT/'work') 
     write(project,'.devbar.json',{'schemaVersion':1,'targets':{'broken':{'strategy':'macBundle','buildComand':'touch MUST_NOT_RUN','artifact':'build/Example.app'}}})
     assert cli('sync',project,'--plan',code=1)['state']=='setupRequired'
     assert not (project/'MUST_NOT_RUN').exists()
-    print('PASS: native Swift wrapper/watch detection, safe macBundle draft, workspace exclusions, VitePress, host plugin/container/empty classification, complete bounded read-only inventory and strict invalid configuration rejection')
+    print('PASS: native Swift wrapper/watch detection, process draft without installed-app replacement, workspace exclusions, VitePress, host plugin/container/empty classification, complete bounded read-only inventory and strict invalid configuration rejection')

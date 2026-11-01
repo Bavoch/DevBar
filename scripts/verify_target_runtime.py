@@ -1,12 +1,14 @@
 """Actual isolated browser extension and iOS simulator lifecycle, without foreground browser windows."""
 from pathlib import Path
-import argparse,hashlib,json,os,subprocess,tempfile,time,urllib.request,signal
+import argparse,hashlib,json,os,subprocess,tempfile,time,urllib.request,signal,sys
 root=Path(__file__).resolve().parents[1];binary=os.environ.get('DEVBAR_TEST_BINARY',str(root/'.build/release/DevBar'))
 parser=argparse.ArgumentParser();parser.add_argument('kind',choices=['extension','ios']);args=parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='Target runtime ',dir=root/'work') as folder:
  base=Path(folder);project=base/'Project with spaces';project.mkdir();state=base/'state';env=dict(os.environ,DEVBAR_DATA_DIR=str(state),DEVBAR_HEADLESS='1')
  def cli(*args,check=True,timeout=45):
-  return subprocess.run([binary,*args],env=env,capture_output=True,text=True,check=check,timeout=timeout)
+  result=subprocess.run([binary,*args],env=env,capture_output=True,text=True,timeout=timeout)
+  if check:assert result.returncode==0,result.stdout+result.stderr
+  return result
  def find():
   return next((p for p in json.loads(cli('--scan-json').stdout) if p['path']==str(project)),None)
  ident=None;bundle=None;device=None
@@ -46,8 +48,12 @@ with tempfile.TemporaryDirectory(prefix='Target runtime ',dir=root/'work') as fo
   device=session.get('device')
   running=find();assert running and running.get('session'),running
   assert running['session']['pid']==session['pid'] and running['session']['kind']==('browserExtension' if args.kind=='extension' else 'ios')
-  menu=next(p for p in json.loads(cli('--menu-json').stdout) if p.get('title')==project.name)
   expected='打开插件' if args.kind=='extension' else '打开模拟器'
+  deadline=time.monotonic()+15
+  while True:
+   menu=next(p for p in json.loads(cli('--menu-json').stdout) if p.get('title')==project.name)
+   if any(p['title']==expected and p.get('action')=='openTargetSession:' for p in menu['items']) or time.monotonic()>deadline:break
+   time.sleep(.25)
   assert any(p['title']==expected and p.get('action')=='openTargetSession:' for p in menu['items'])
   if args.kind=='extension':
    key=hashlib.sha256(str(project).encode()).hexdigest();active=state/'browsers'/key/'DevToolsActivePort'
@@ -72,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='Target runtime ',dir=root/'work') as fo
       session=candidate;break
     except (FileNotFoundError,StopIteration,json.JSONDecodeError):pass
     time.sleep(.25)
-   assert session['pid']!=previous, 'Extension source edit did not reload browser session'
+   assert session['pid']!=previous, 'Extension source edit did not reload browser session: '+ '\n'.join(p.read_text(errors='replace')[-4000:] for p in state.glob('*.log'))
    print('PASS: extension source edit automatically replaces the isolated development browser session')
   else:
    installed=subprocess.check_output(['xcrun','simctl','listapps',device],text=True)
@@ -102,6 +108,8 @@ with tempfile.TemporaryDirectory(prefix='Target runtime ',dir=root/'work') as fo
   cli('--stop-project',ident)
   print('PASS: stop removes target runtime and repeat launch produces a new verified session')
  finally:
+  if sys.exc_info()[0]:
+   (root/('work/runtime-'+args.kind+'-failure.log')).write_text('\n'.join(str(p)+'\n'+p.read_text(errors='replace') for p in state.rglob('*.log')))
   if ident:
    cli('--stop-project',ident,check=False)
   if bundle and device:

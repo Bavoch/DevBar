@@ -13,7 +13,7 @@ import time
 import urllib.request
 
 root = Path(__file__).resolve().parents[1]
-binary = str(root / '.build/release/DevBar')
+binary = os.environ.get('DEVBAR_TEST_BINARY', str(root / '.build/release/DevBar'))
 http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def until(check, message, timeout=40):
@@ -72,8 +72,16 @@ with tempfile.TemporaryDirectory(prefix='Development entry ', dir=root/'work') a
         assert not any(t['id']=='dev' for t in profile['targets']), profile
         print('PASS: build/preview/artifact rejection and selection of the actual desktop development entry')
 
+        swift_project = base/'declared-swift-development'; swift_project.mkdir()
+        (swift_project/'Package.swift').write_text('let package=Package(targets:[.executableTarget(name:"Example")])')
+        (swift_project/'package.json').write_text(json.dumps({'scripts': {'dev':'swift run Example'}}))
+        swift_profile = json.loads(cli('--profile-project', str(swift_project)).stdout)
+        assert swift_profile['targets'][0]['command'] == 'npm run dev', swift_profile
+        assert swift_profile['targets'][0]['id'] == 'dev', swift_profile
+        print('PASS: a declared development entry wins over inferred language-specific launch commands')
+
         # Native apps have no windows. Their independent bundle IDs exercise the
-        # same Launch Services identity and graceful-quit path as a desktop app.
+        # same Launch Services identity as a desktop app without visible windows.
         source = base/'Fixture.swift'
         source.write_text('''import AppKit
 final class Delegate: NSObject, NSApplicationDelegate {
@@ -128,14 +136,16 @@ http.server.HTTPServer(("127.0.0.1",{port}),Handler).serve_forever()
         def response():
             with http.open(f'http://127.0.0.1:{port}',timeout=.5) as reply:
                 return json.load(reply)
-        first = until(response, 'Development runtime did not start after graceful switch')
-        assert Path(str(installed)+'.quit').exists(), 'Installed fixture was not gracefully terminated'
+        first = until(response, 'Development runtime did not start')
+        assert not Path(str(installed)+'.quit').exists(), 'Development start terminated the installed application'
         assert not Path(str(unrelated)+'.quit').exists(), 'Unrelated application was terminated'
         cli('--restart-project', ident)
         until(lambda: response()['pid'] != first['pid'], 'Explicit restart did not replace the owned runtime')
         assert not Path(str(unrelated)+'.quit').exists()
+        assert not Path(str(installed)+'.quit').exists(), 'Restart terminated the installed application'
         cli('--stop-project', ident)
-        print('PASS: graceful installed-to-development switch, unrelated-app isolation, explicit restart')
+        assert not Path(str(installed)+'.quit').exists(), 'Stop terminated the installed application'
+        print('PASS: installed and unrelated apps survive development start/restart/stop')
 
         project = base/'failed-runtime'; project.mkdir()
         marker = base/'fail-on-start'; marker.write_text('fail')

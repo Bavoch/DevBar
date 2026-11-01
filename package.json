@@ -1,0 +1,9 @@
+{
+  "name": "devbar",
+  "private": true,
+  "scripts": {
+    "dev": "zsh scripts/dev.sh sync",
+    "dev:status": "zsh scripts/dev.sh status",
+    "dev:stop": "zsh scripts/dev.sh stop"
+  }
+}

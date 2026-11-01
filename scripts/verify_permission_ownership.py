@@ -1,6 +1,9 @@
-"""Verify public Launch Services/launchd routes without windows or private APIs. TCC is tested separately with QuiX."""
+"""Verify isolated Launch Services/launchd ownership without windows or private APIs.
+
+Actual interactive privacy permission use requires separate target-app acceptance.
+"""
 from pathlib import Path
-import json, os, plistlib, shlex, shutil, signal, subprocess, tempfile, time
+import hashlib, json, os, plistlib, re, shlex, shutil, signal, subprocess, tempfile, time
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('DEVBAR_TEST_BINARY', ROOT / '.build/release/DevBar')).resolve()
@@ -21,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix='Permission ownership ', dir=ROOT / 'wor
     source = base/'Fixture.m'
     source.write_text(r'''
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
 #include <sys/wait.h>
 int main(int argc, char **argv) {
@@ -29,6 +33,7 @@ int main(int argc, char **argv) {
   [application setActivationPolicy:NSApplicationActivationPolicyProhibited];
   NSString *directory = [NSString stringWithUTF8String:argv[argc-1]];
   NSString *mode = argc > 2 ? [NSString stringWithUTF8String:argv[1]] : @"probe";
+  if ([mode isEqualToString:@"probe"] || [mode isEqualToString:@"child"]) CGPreflightScreenCaptureAccess();
   NSDictionary *report = @{@"pid": @(getpid()), @"parent": @(getppid()), @"bundle": NSBundle.mainBundle.bundleIdentifier ?: @""};
   NSString *file = [directory stringByAppendingPathComponent:[mode stringByAppendingString:@".json"]];
   [[NSJSONSerialization dataWithJSONObject:report options:0 error:nil] writeToFile:file atomically:YES];
@@ -49,7 +54,7 @@ int main(int argc, char **argv) {
 }
 ''')
     native = base/'Fixture'
-    subprocess.run(['clang','-framework','AppKit',str(source),'-o',str(native)],check=True,capture_output=True)
+    subprocess.run(['clang','-framework','AppKit','-framework','CoreGraphics',str(source),'-o',str(native)],check=True,capture_output=True)
     def app(path, identifier):
         (path/'Contents/MacOS').mkdir(parents=True)
         shutil.copy2(native,path/'Contents/MacOS/Fixture')
@@ -66,9 +71,10 @@ int main(int argc, char **argv) {
     # For the native route use a tiny wrapper main with the same native probe.
     native_source = source.read_text().replace('NSString *directory = [NSString stringWithUTF8String:argv[argc-1]];', 'NSString *directory = argc > 1 ? [NSString stringWithUTF8String:argv[argc-1]] : @'+json.dumps(str(base/'native'))+';')
     source.write_text(native_source)
-    subprocess.run(['clang','-framework','AppKit',str(source),'-o',str(target/'Contents/MacOS/Fixture')],check=True,capture_output=True)
+    subprocess.run(['clang','-framework','AppKit','-framework','CoreGraphics',str(source),'-o',str(target/'Contents/MacOS/Fixture')],check=True,capture_output=True)
     subprocess.run(['codesign','--force','--sign','-',str(target)],check=True,capture_output=True)
     managed = []
+    saved_ids = []
     def cli(*args, check=True):
         return subprocess.run([str(BINARY),*args],env=env,capture_output=True,text=True,check=check,timeout=45)
     def run_manager(args, output, executable=BINARY):
@@ -85,7 +91,36 @@ int main(int argc, char **argv) {
         managed.append(probe['pid'])
         assert probe['parent']!=owner['pid'], (probe,owner)
         assert child['parent']==probe['pid'], (child,probe)
+        # Checking only the GUI manager's immediate parent missed a DevBar CLI
+        # supervisor between that manager and the actual development command.
+        rows = {}
+        for line in subprocess.check_output(['ps','-axo','pid=,ppid=,comm='],text=True).splitlines():
+            fields=line.strip().split(None,2)
+            if len(fields)==3: rows[int(fields[0])] = (int(fields[1]), fields[2])
+        pid=probe['pid']
+        while pid in rows and pid != 1:
+            parent, executable=rows[pid]
+            assert Path(executable).name != 'DevBar' and pid != owner['pid'], (pid,executable,probe)
+            pid=parent
+        assert pid == 1, ('Incomplete ancestor chain',probe)
         return probe
+
+    def tcc_evidence(probe):
+        # Preflight only: no permission prompt, screen capture or TCC reset.
+        pid=probe['pid']
+        predicate=f'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "pid={pid}"'
+        def attribution():
+            result=subprocess.run(['/usr/bin/log','show','--last','3m','--style','compact',
+                '--info','--debug','--predicate',predicate],capture_output=True,text=True,check=True,timeout=20)
+            for line in result.stdout.splitlines():
+                if 'Handling access request to kTCCServiceScreenCapture,' in line and f'pid={pid},' in line:
+                    return line
+        line=wait(attribution,'TCC attribution for development command unavailable',timeout=30)
+        responsible=re.search(r'Resp:\{([^}]+)\}',line)
+        assert responsible, line
+        assert f'pid={pid},' in responsible[1], line
+        assert f'binary_path={project / "tool"}' in responsible[1], line
+        print('PASS: real ScreenCapture preflight TCC responsible identity is the development target, not DevBar')
     try:
         # Control proves the test can detect this bug, rather than always pass.
         control=base/'control'
@@ -101,9 +136,11 @@ int main(int argc, char **argv) {
         tool=project/'tool'; shutil.copy2(native,tool); os.chmod(tool,0o700)
         command=shlex.join([str(tool),'probe',str(output)])
         ident=cli('--add-project',str(project),'--name','PermissionFixture','--command',command).stdout.strip()
+        saved_ids.append(ident)
         parent=run_manager(['--start-project',ident],output)
         probe=evidence(output,parent)
-        record=json.loads((base/'state'/f'{ident}.run.json').read_text())
+        tcc_evidence(probe)
+        record=wait(lambda: next((json.loads(file.read_text()) for file in (base/'state').glob(f'{ident}.target-*.run.json') if json.loads(file.read_text()).get('exitCode') is None), None), 'managed target record missing')
         live=subprocess.check_output(['ps','-p',str(record['pid']),'-o','ppid='],text=True).strip()
         assert live=='1' and record['launchID'], record
         cli('--stop-project',ident)
@@ -120,30 +157,42 @@ int main(int argc, char **argv) {
 
         (project/'.devbar.json').unlink()
         output=base/'native';output.mkdir()
-        parent=run_manager(['--run-target',str(project),'--target','bundle'],output)
-        probe=evidence(output,parent)
-        session=wait(lambda: next((base/'state/targets').glob('*.json')),'bundle session missing')
-        record=json.loads(session.read_text());assert record['pid']==probe['pid'] and record['bundleID']==info['CFBundleIdentifier'], record
-        cli('--stop-project',ident)
-        print('PASS: native bundle launches through Launch Services; exact PID/bundle and normal stop verified')
-
         desktop=base/'Desktop project';desktop.mkdir()
         shutil.copytree(target,desktop/'build/Fixture.app')
         (desktop/'Info.plist').write_bytes(plistlib.dumps(info))
+        installed=desktop/'work/Independent.app'
         (desktop/'.devbar.json').write_text(json.dumps({'schemaVersion':1,'targets':{'desktop':{
-            'strategy':'macBundle','buildCommand':'/usr/bin/true','artifact':'build/Fixture.app',
-            'installPath':str(desktop/'work/Independent.app'),'bundleIdentifier':info['CFBundleIdentifier'],
+            'strategy':'macBundle','buildCommand':'/usr/bin/touch SYNC_BUILD_RAN','artifact':'build/Fixture.app',
+            'installPath':str(installed),'bundleIdentifier':info['CFBundleIdentifier'],
             'sourcePaths':['Info.plist'],'timeout':30}}}))
-        for name in ['probe.json','child.json']:
-            (output/name).unlink(missing_ok=True)
-        desktop_id=cli('--add-project',str(desktop)).stdout.strip()
-        parent=run_manager(['--start-project',desktop_id],base/'desktop-manager')
-        probe=evidence(output,parent)
-        report=wait(lambda: (lambda v: v if v.get('state')=='current' else None)(json.loads(cli('status',str(desktop),'--target','desktop','--json',check=False).stdout)), 'desktop startup did not use macBundle')
-        assert report['receipt']['pid']==probe['pid'],report
-        assert report['receipt']['executable']==str(desktop/'work/Independent.app/Contents/MacOS/Fixture'),report
+        ordinary=base/'ordinary';ordinary.mkdir()
+        desktop_id=cli('--add-project',str(desktop),'--command',shlex.join([str(tool),'probe',str(ordinary)])).stdout.strip()
+        saved_ids.append(desktop_id)
+        parent=run_manager(['--start-project',desktop_id],base/'ordinary-manager')
+        evidence(ordinary,parent)
+        assert not installed.exists() and not (desktop/'SYNC_BUILD_RAN').exists()
         cli('--stop-project',desktop_id)
-        print('PASS: ordinary desktop Start automatically builds/installs/opens its independent app, without running the development command')
+        print('PASS: ordinary Start honors the saved command and never invokes configured macBundle installation')
+
+        # A prebuilt bundle without a source build/watch path must fail visibly;
+        # its existence is not enough to make it a development session.
+        cli('--select-target',desktop_id,'--target','bundle')
+        rejected=cli('--start-project',desktop_id,check=False)
+        assert rejected.returncode != 0 and 'dev/watch' in rejected.stderr, (rejected.stdout,rejected.stderr)
+        assert not installed.exists() and not (desktop/'SYNC_BUILD_RAN').exists()
+        cli('--stop-project',desktop_id)
+        print('PASS: bundle-only target cannot masquerade as a development session')
+
+        parent=run_manager(['sync',str(desktop),'--target','desktop','--json'],base/'sync-manager')
+        probe=evidence(output,parent)
+        assert probe['bundle']==info['CFBundleIdentifier'],probe
+        report=wait(lambda: (lambda value: value if value.get('state')=='current' else None)(json.loads(cli('status',str(desktop),'--target','desktop','--json',check=False).stdout)), 'explicit macBundle sync did not complete')
+        assert report['receipt']['pid']==probe['pid'],report
+        assert report['receipt']['executable']==str(installed/'Contents/MacOS/Fixture'),report
+        assert (desktop/'SYNC_BUILD_RAN').exists()
+        os.kill(probe['pid'],signal.SIGTERM)
+        wait(lambda: subprocess.run(['ps','-p',str(probe['pid']),'-o','stat='],capture_output=True,text=True).stdout.strip() in ('', 'Z'), 'native fixture did not exit')
+        print('PASS: explicit macBundle sync uses Launch Services with exact PID, bundle identity and installed executable')
 
         symbols=subprocess.check_output(['nm','-u',str(BINARY)],text=True)
         assert 'responsibility_' not in symbols
@@ -151,6 +200,8 @@ int main(int argc, char **argv) {
         print('PASS: product has no private responsibility API or launch helper')
 
     finally:
+        for ident in saved_ids:
+            subprocess.run([str(BINARY),'--stop-project',ident],env=env,capture_output=True,timeout=30)
         for pid in reversed(managed):
             try: os.kill(pid,signal.SIGTERM)
             except ProcessLookupError: pass

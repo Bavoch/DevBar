@@ -70,6 +70,12 @@ with tempfile.TemporaryDirectory(prefix='Panel latency ', dir=root / 'work') as 
             assert not listening(port), f'{target} listener survived the panel stop action'
             if target == 'dev':
                 assert listening(ports[1]), 'stopping frontend also stopped backend'
+        for target, port in zip(('dev', 'dev:backend'), ports):
+            cli('--start-project', ident, '--target', target)
+            until(lambda: listening(port))
+        result = cli('--self-test-interaction-latency', '--stop-fixture', str(project))
+        print(result.stdout, end='', flush=True)
+        assert not any(listening(port) for port in ports), 'Project Stop must stop every recorded target'
         assert any(row['id'] == ident for row in json.loads(cli('--list-projects').stdout))
         print('PASS: actual npm run dev sessions, 60 project controls, independent targets, final stopped row and persisted configuration', flush=True)
     finally:

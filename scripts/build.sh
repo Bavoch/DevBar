@@ -8,6 +8,7 @@ previous="$PWD/dist/.DevBar-previous-$$.app"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
 cp .build/release/DevBar "$stage/Contents/MacOS/DevBar"
+cp -R .build/release/DevBar_DevBar.bundle "$stage/Contents/Resources/"
 cp scripts/devbar scripts/install-cli.sh "$stage/Contents/Resources/"
 cp -R drivers "$stage/Contents/Resources/drivers"
 find "$stage/Contents/Resources/drivers" -type d -name __pycache__ -prune -exec rm -rf {} +
@@ -24,8 +25,8 @@ cat > "$stage/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.devbar.app</string>
 <key>CFBundleName</key><string>DevBar</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.15.0</string>
-<key>CFBundleVersion</key><string>32</string>
+<key>CFBundleShortVersionString</key><string>0.16.0</string>
+<key>CFBundleVersion</key><string>33</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
