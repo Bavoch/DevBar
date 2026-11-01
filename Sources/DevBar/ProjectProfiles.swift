@@ -28,11 +28,58 @@ enum ProjectProfiles {
     private static let cacheLock = NSLock()
     private static var cache: [String: (Date, ProjectProfile)] = [:]
 
+    /// Auto-discovery must not probe private folders just because another
+    /// process mentions them. Explicitly added projects are handled separately.
+    static func requiresExplicitDirectorySelection(_ path: String) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let folders = ["Documents", "Desktop", "Downloads", "Library/Mobile Documents", "Library/CloudStorage"]
+            .map { home + "/" + $0 }
+        func contains(_ path: String) -> Bool { folders.contains { path == $0 || path.hasPrefix($0 + "/") } }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if contains(url.path) { return true }
+        return contains(url.resolvingSymlinksInPath().path)
+    }
+
+    /// An application bundle is a build/install artifact, never a source project.
+    /// Check both spellings so symlink aliases cannot expose its internal folders.
+    static func isApplicationBundlePath(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        return [url, url.resolvingSymlinksInPath()].contains { candidate in
+            candidate.pathComponents.contains { $0.lowercased().hasSuffix(".app") }
+        }
+    }
+
     static func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    static func data(_ url: URL, limit: Int = 1_000_000) -> Data? {
+        // A process can point at an untrusted checkout. Open without following a
+        // swapped symlink or waiting for a FIFO writer, then verify that same fd.
+        let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        var attributes = stat()
+        guard fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              attributes.st_size >= 0, attributes.st_size <= off_t(limit) else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        guard let result = try? handle.read(upToCount: limit + 1), result.count <= limit else { return nil }
+        return result
+    }
+    static func text(_ url: URL, limit: Int = 1_000_000) -> String? {
+        data(url, limit: limit).flatMap { String(data: $0, encoding: .utf8) }
+    }
+    static func plist(_ url: URL, limit: Int = 512_000) -> [String: Any]? {
+        guard let contents = data(url, limit: limit) else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: contents, format: nil)) as? [String: Any]
+    }
     static func json(_ url: URL) -> [String: Any]? {
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 1_000_000,
-              let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = data(url) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data, options: ["json5", "jsonc"].contains(url.pathExtension) ? [.json5Allowed] : [])) as? [String: Any]
+    }
+    static func externalDeclaration(_ root: URL) -> URL? {
+        let names = ["package.json", "Package.swift", "Cargo.toml", "pyproject.toml", "go.mod", "pubspec.yaml", "manifest.json", "project.yml", "Info.plist", "pnpm-workspace.yaml", "tauri.conf.json", "src-tauri/tauri.conf.json", "electron-builder.json", "electron-builder.json5", "electron-builder.yml", "electron-builder.yaml", "manifest.config.js", "manifest.config.ts", "project.config.json", "app.json", ".devbar.json", "src", "Sources"]
+        return names.map { root.appendingPathComponent($0) }.first { file in
+            FileManager.default.fileExists(atPath: file.path) && !file.resolvingSymlinksInPath().path.hasPrefix(root.path + "/")
+        }
     }
     static func manager(_ root: URL, package: [String: Any]) -> String? {
         if let declared = package["packageManager"] as? String {
@@ -59,6 +106,9 @@ enum ProjectProfiles {
     }
     static func profile(_ path: String, nested: Bool = true) -> ProjectProfile {
         let root = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        guard !isApplicationBundlePath(path) else {
+            return ProjectProfile(path: root.path, targets: [], notes: ["这是应用包或其内部目录，请选择应用的源码项目目录。"])
+        }
         let cacheKey = root.path + (nested ? ":nested" : ":single")
         cacheLock.lock()
         let cached = cache[cacheKey]
@@ -66,6 +116,12 @@ enum ProjectProfiles {
         if let cached, Date().timeIntervalSince(cached.0) < 5 { return cached.1 }
 
         let fm = FileManager.default
+        func withinProject(_ file: URL) -> Bool {
+            file.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(root.path + "/")
+        }
+        if externalDeclaration(root) != nil {
+            return ProjectProfile(path: root.path, targets: [], notes: ["项目配置或源码链接到目录之外，请添加实际项目目录或设置运行命令。"])
+        }
         if root.lastPathComponent == "src-tauri", fm.fileExists(atPath: root.appendingPathComponent("tauri.conf.json").path),
            fm.fileExists(atPath: root.deletingLastPathComponent().appendingPathComponent("package.json").path) {
             let parent = profile(root.deletingLastPathComponent().path, nested: false)
@@ -75,13 +131,16 @@ enum ProjectProfiles {
             }
             return ProjectProfile(path: root.path, targets: targets, notes: ["Tauri 子目录使用父项目启动方式，同时管理前端。"])
         }
-        func exists(_ name: String) -> Bool { fm.fileExists(atPath: root.appendingPathComponent(name).path) }
+        func exists(_ name: String) -> Bool {
+            let file = root.appendingPathComponent(name).resolvingSymlinksInPath()
+            let kind = (try? fm.attributesOfItem(atPath: file.path)[.type]) as? FileAttributeType
+            return kind == .typeRegular || kind == .typeDirectory
+        }
         let package = json(root.appendingPathComponent("package.json")) ?? [:]
         let scripts = (package["scripts"] as? [String: String] ?? [:]).filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         let dependencies = (package["dependencies"] as? [String: Any] ?? [:]).merging(package["devDependencies"] as? [String: Any] ?? [:]) { a, _ in a }
         let manager = manager(root, package: package)
         let extensionProject = json(root.appendingPathComponent("manifest.json"))?["manifest_version"] != nil || exists("manifest.config.js") || exists("manifest.config.ts") || dependencies["wxt"] != nil || dependencies["plasmo"] != nil || dependencies["@crxjs/vite-plugin"] != nil
-        let nativeSwift = exists("Package.swift") && (scripts["dev"]?.contains("swift ") == true || scripts.isEmpty)
         let desktop = dependencies["electron"] != nil || dependencies["@tauri-apps/cli"] != nil || exists("src-tauri/tauri.conf.json")
         let expo = dependencies["expo"] != nil || dependencies["react-native"] != nil
         let miniapp = dependencies.keys.contains { $0.hasPrefix("@tarojs/") } || exists("project.config.json")
@@ -92,10 +151,16 @@ enum ProjectProfiles {
             targets.append(LaunchTarget(id: id, title: title, kind: kind, directory: root.path, command: command, container: container, scheme: scheme, note: note, script: script))
         }
         func npm(_ key: String, _ title: String, _ kind: LaunchTarget.Kind) {
-            guard scripts[key] != nil, let manager else { return }
+            guard scripts[key] != nil, let manager, developmentScript(key) else { return }
             // Keep ordinary commands familiar and backward-compatible.
             let cmd = manager == "yarn" ? "yarn \(key)" : "\(manager) run \(key)"
             add(key, title, kind, cmd)
+        }
+        func developmentScript(_ key: String) -> Bool {
+            guard scripts[key] != nil, let manager else { return false }
+            // Validate the invocation so aliases and package lifecycle hooks are
+            // checked as well as the script body.
+            return (try? DevelopmentRuntime.validate(script(key, manager: manager), root: root)) != nil
         }
         if extensionProject {
             add("extension", "浏览器插件", .browserExtension, runner(root.path, id: "extension"), note: "使用独立 Chromium 测试会话；预览网页不代表插件已加载。")
@@ -104,8 +169,7 @@ enum ProjectProfiles {
             let tauri = dependencies["@tauri-apps/cli"] != nil || exists("src-tauri/tauri.conf.json")
             let candidates = ["dev", "dev:hot", "dev:desktop", "desktop:dev", "tauri:dev", "electron:dev", "desktop"]
             let chosen = candidates.first { key in
-                guard let raw = scripts[key] else { return false }
-                guard (try? DevelopmentRuntime.validate(raw, root: root)) != nil else { return false }
+                guard let raw = scripts[key], developmentScript(key) else { return false }
                 let text = DevelopmentRuntime.expanded(raw, root: root)
                 if tauri { return text.range(of: #"\btauri\s+dev\b"#, options: .regularExpression) != nil }
                 // A renderer-only Vite script cannot start the desktop product.
@@ -120,7 +184,7 @@ enum ProjectProfiles {
             } else { notes.append("没有可确认的桌面开发命令；前端服务不代表桌面应用已运行。") }
             npm("dev:web", "网页端", .web)
             if let dev = scripts["dev"], chosen != "dev", !dev.contains("tauri"), !dev.contains("electron"),
-               (try? DevelopmentRuntime.validate(dev, root: root)) != nil { npm("dev", "网页端", .web) }
+               developmentScript("dev") { npm("dev", "网页端", .web) }
         } else if expo {
             npm("start", "移动开发服务", .service)
             if let expo = json(root.appendingPathComponent("app.json"))?["expo"] as? [String: Any],
@@ -133,8 +197,8 @@ enum ProjectProfiles {
             npm("dev:weapp", "微信小程序", .miniapp)
             npm("dev:h5", "H5 网页", .web)
             if targets.isEmpty { npm("dev", "小程序开发", .miniapp) }
-        } else if !extensionProject && !nativeSwift {
-            if let key = ["dev", "start", "serve", "watch", "docs:dev"].first(where: { scripts[$0] != nil }) {
+        } else if !extensionProject {
+            if let key = ["dev", "start", "serve", "watch", "docs:dev"].first(where: developmentScript) {
                 let text = scripts[key]!.lowercased()
                 let composite = ["concurrently", "turbo ", " -r ", "run-p "].contains(where: text.contains)
                 let web = !composite && (["vite", "next", "astro", "remix", "nuxt", "svelte", "http.server", "shopify theme"].contains(where: text.contains) || dependencies["vite"] != nil && text.hasPrefix("node ") && scripts["dev:backend"] == nil)
@@ -155,7 +219,7 @@ enum ProjectProfiles {
             if let index = targets.firstIndex(where: { $0.id == key }) { targets[index].note = "运行已有真机开发脚本；需要连接、签名和设备权限。本地任务运行不代表手机 App 已成功更新。" }
         }
         if exists("Package.swift"), targets.isEmpty {
-            let text = (try? String(contentsOf: root.appendingPathComponent("Package.swift"), encoding: .utf8)) ?? ""
+            let text = Self.text(root.appendingPathComponent("Package.swift")) ?? ""
             if text.contains(".executableTarget(") || text.contains(".executable(") {
                 let sources = root.appendingPathComponent("Sources")
                 let enumerator = fm.enumerator(at: sources, includingPropertiesForKeys: [.fileSizeKey])
@@ -164,7 +228,7 @@ enum ProjectProfiles {
                 while let file = enumerator?.nextObject() as? URL, visited < 100 {
                     visited += 1
                     if file.pathExtension == "swift", let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 256_000,
-                       let source = try? String(contentsOf: file, encoding: .utf8), ["import AppKit", "import SwiftUI", "import Cocoa"].contains(where: source.contains) { gui = true; break }
+                       let source = Self.text(file, limit: 256_000), ["import AppKit", "import SwiftUI", "import Cocoa"].contains(where: source.contains) { gui = true; break }
                 }
                 let products = swiftProducts(text)
                 let helper = !products.isEmpty && products.allSatisfy { $0.hasSuffix("-helper") }
@@ -179,10 +243,10 @@ enum ProjectProfiles {
             else { notes.append("Swift 包未声明可执行产品，不生成 swift run。") }
         }
         if exists("Cargo.toml"), !exists("src-tauri"), targets.isEmpty {
-            let text = (try? String(contentsOf: root.appendingPathComponent("Cargo.toml"), encoding: .utf8)) ?? ""
+            let text = Self.text(root.appendingPathComponent("Cargo.toml")) ?? ""
             if text.contains("[[bin]]") || exists("src/main.rs") {
                 add("rust", "Rust 程序", .script, "cargo run")
-                let main = (try? String(contentsOf: root.appendingPathComponent("src/main.rs"), encoding: .utf8)) ?? ""
+                let main = Self.text(root.appendingPathComponent("src/main.rs")) ?? ""
                 if main.contains("#[cfg(windows)]"), main.contains("#[cfg(not(windows))]"), text.contains("cfg(windows)") { targets[targets.count - 1].requiredPlatform = "Windows" }
                 if text.range(of: #"(?m)^ashpd\s*="#, options: .regularExpression) != nil, text.range(of: #"(?m)^evdev\s*="#, options: .regularExpression) != nil { targets[targets.count - 1].requiredPlatform = "Linux" }
             }
@@ -190,11 +254,11 @@ enum ProjectProfiles {
         }
         if exists("go.mod"), targets.isEmpty {
             let files = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-            if files.filter({ $0.pathExtension == "go" }).contains(where: { ((try? String(contentsOf: $0, encoding: .utf8)) ?? "").contains("func main(") }) { add("go", "Go 程序", .script, "go run .") }
+            if files.filter({ $0.pathExtension == "go" }).contains(where: { (Self.text($0) ?? "").contains("func main(") }) { add("go", "Go 程序", .script, "go run .") }
             else { notes.append("Go 库未发现 main 入口。") }
         }
         if exists("pyproject.toml"), targets.isEmpty {
-            let text = (try? String(contentsOf: root.appendingPathComponent("pyproject.toml"), encoding: .utf8)) ?? ""
+            let text = Self.text(root.appendingPathComponent("pyproject.toml")) ?? ""
             if let section = text.range(of: "[project.scripts]") {
                 let entries = text[section.upperBound...].components(separatedBy: "\n").prefix(while: { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("[") })
                 for line in entries {
@@ -205,16 +269,22 @@ enum ProjectProfiles {
                         let entry = pair[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
                         let module = entry.split(separator: ":").first.map(String.init) ?? ""
                         let relative = module.replacingOccurrences(of: ".", with: "/")
-                        let source = ["src/" + relative + ".py", relative + ".py", "src/" + relative + "/__init__.py", relative + "/__init__.py"].map { root.appendingPathComponent($0).path }.first { fm.fileExists(atPath: $0) }
+                        let candidates = ["src/" + relative + ".py", relative + ".py", "src/" + relative + "/__init__.py", relative + "/__init__.py"].map { root.appendingPathComponent($0) }
+                        if candidates.contains(where: { fm.fileExists(atPath: $0.path) && !withinProject($0) }) { continue }
+                        let source = candidates.first { fm.fileExists(atPath: $0.path) }?.path
                         add("python:" + name, name, .script, fm.isExecutableFile(atPath: local) ? quote(local) : "uv run " + quote(name), container: source, script: entry)
                     }
                 }
             }
         }
         if targets.isEmpty {
-            for file in ["manage.py", "server.py", "app.py", "main.py", "server.mjs", "server.js"] where exists(file) {
+            for file in ["manage.py", "server.py", "app.py", "main.py", "run.py", "server.mjs", "server.js"] where exists(file) {
+                guard withinProject(root.appendingPathComponent(file)) else { continue }
                 let executable = file.hasSuffix(".py") ? (exists(".venv/bin/python") ? quote(root.appendingPathComponent(".venv/bin/python").path) : "python3") : "node"
-                add("file:" + file, file == "manage.py" ? "Django" : "本地程序", .service, executable + " " + quote(file) + (file == "manage.py" ? " runserver" : ""))
+                let standalone = ["app.py", "main.py", "run.py"].contains(file)
+                let source = standalone ? Self.text(root.appendingPathComponent(file), limit: 256_000) ?? "" : ""
+                let framework = ["flask", "fastapi", "uvicorn", "http.server", "aiohttp", "sanic", "tornado", "gradio", "streamlit"].contains { source.lowercased().contains($0) }
+                add("file:" + file, file == "manage.py" ? "Django" : "本地程序", standalone && !framework ? .script : .service, executable + " " + quote(file) + (file == "manage.py" ? " runserver" : ""))
                 break
             }
         }
@@ -223,9 +293,9 @@ enum ProjectProfiles {
             add("flutter:web", "网页端", .web, "flutter run -d web-server")
         }
         let children = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-        for container in children.filter({ ["xcodeproj", "xcworkspace"].contains($0.pathExtension) }).sorted(by: { $0.path < $1.path }) {
+        for container in children.filter({ ["xcodeproj", "xcworkspace"].contains($0.pathExtension) && withinProject($0) }).sorted(by: { $0.path < $1.path }) {
             let scheme = container.deletingPathExtension().lastPathComponent
-            let pbx = (try? String(contentsOf: container.appendingPathComponent("project.pbxproj"), encoding: .utf8)) ?? ""
+            let pbx = Self.text(container.appendingPathComponent("project.pbxproj"), limit: 4_194_304) ?? ""
             let mobile = pbx.contains("iphoneos") || pbx.contains("SDKROOT = auto") && pbx.contains("IPHONEOS_DEPLOYMENT_TARGET")
             guard pbx.contains("com.apple.product-type.application") else { notes.append("Xcode 工程未确认应用产品，不猜测 scheme。"); continue }
             if mobile {
@@ -238,7 +308,7 @@ enum ProjectProfiles {
         }
         if targets.isEmpty, exists("project.yml") {
             let url = root.appendingPathComponent("project.yml")
-            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let text = Self.text(url) ?? ""
             let config = json(url)
             let name = config?["name"] as? String ?? text.components(separatedBy: "\n").first(where: { $0.hasPrefix("name:") }).map { String($0.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines) }
             if let name, !name.isEmpty, !name.contains("/"), config != nil || text.contains("platform: iOS") || text.contains("platform: macOS") {
@@ -247,7 +317,7 @@ enum ProjectProfiles {
                 add(id, mobile ? "iOS 模拟器" : "macOS 应用", mobile ? .ios : .desktop, runner(root.path, id: id), container: root.appendingPathComponent(name + ".xcodeproj").path, scheme: name, note: "首次运行使用 XcodeGen 生成工程。")
             } else { notes.append("XcodeGen 配置尚不能唯一确定应用目标。") }
         }
-        if targets.isEmpty, exists("Info.plist"), let info = NSDictionary(contentsOf: root.appendingPathComponent("Info.plist")) as? [String: Any],
+        if targets.isEmpty, exists("Info.plist"), let info = plist(root.appendingPathComponent("Info.plist")),
            let executable = info["CFBundleExecutable"] as? String {
             for folder in ["build", "out", "dist"] {
                 let bundle = root.appendingPathComponent(folder + "/" + executable + ".app")
@@ -258,7 +328,7 @@ enum ProjectProfiles {
             }
         }
         if targets.isEmpty, package.isEmpty || scripts.isEmpty && dependencies.isEmpty {
-            let html = children.filter { $0.pathExtension.lowercased() == "html" }.sorted { $0.lastPathComponent == "index.html" ? true : $1.lastPathComponent == "index.html" ? false : $0.path < $1.path }
+            let html = children.filter { $0.pathExtension.lowercased() == "html" && withinProject($0) && (try? fm.attributesOfItem(atPath: $0.resolvingSymlinksInPath().path)[.type]) as? FileAttributeType == .typeRegular }.sorted { $0.lastPathComponent == "index.html" ? true : $1.lastPathComponent == "index.html" ? false : $0.path < $1.path }
             for file in html.prefix(20) {
                 if let driver = try? AutomaticSync.resource("live-static.py") {
                     add("static:" + file.lastPathComponent, file.lastPathComponent == "index.html" ? "静态网页" : file.lastPathComponent, .staticWeb,
@@ -270,7 +340,7 @@ enum ProjectProfiles {
             // Surface real workspace applications, excluding dependency/build/backup trees.
             var discovered = Set<String>()
             var workspacePatterns = package["workspaces"] as? [String] ?? (package["workspaces"] as? [String: Any])?["packages"] as? [String] ?? []
-            if let yaml = try? String(contentsOf: root.appendingPathComponent("pnpm-workspace.yaml"), encoding: .utf8) {
+            if let yaml = Self.text(root.appendingPathComponent("pnpm-workspace.yaml")) {
                 workspacePatterns += yaml.components(separatedBy: .newlines).compactMap { line in
                     let value = line.trimmingCharacters(in: .whitespaces)
                     guard value.hasPrefix("- ") else { return nil }
@@ -368,7 +438,14 @@ enum ProjectProfiles {
         }
         if targets.isEmpty { notes.append("未发现可确认的运行入口；可能是素材、库、备份或空目录，不生成猜测命令。") }
         if manager == nil, !scripts.isEmpty { notes.append("声明了不支持的包管理器，未生成替代命令。") }
-        for index in targets.indices { targets[index].environmentIssue = TargetRuntime.environmentIssue(targets[index]) }
+        for index in targets.indices {
+            let target = targets[index]
+            if let issue = TargetRuntime.environmentIssue(target) { targets[index].environmentIssue = issue }
+            else if target.kind != .tool {
+                do { try DevelopmentRuntime.validate(localCommand(target, owner: root.path), root: URL(fileURLWithPath: target.directory)) }
+                catch { targets[index].environmentIssue = error.localizedDescription }
+            }
+        }
         let result = ProjectProfile(path: root.path, targets: targets, notes: notes)
         cacheLock.lock()
         if cache.count > 500 { cache.removeAll(keepingCapacity: true) }
@@ -384,6 +461,15 @@ enum ProjectProfiles {
         let products = names("executable")
         return products.isEmpty ? names("executableTarget") : products
     }
+    static func localCommand(_ target: LaunchTarget, owner: String) -> String {
+        let origin = URL(fileURLWithPath: owner).standardizedFileURL.pathComponents
+        let destination = URL(fileURLWithPath: target.directory).standardizedFileURL.pathComponents
+        let shared = zip(origin, destination).prefix { $0 == $1 }.count
+        let relative = (Array(repeating: "..", count: origin.count - shared) + destination.dropFirst(shared)).joined(separator: "/")
+        guard !relative.isEmpty else { return target.command }
+        let prefix = "cd " + quote(relative) + " && "
+        return target.command.hasPrefix(prefix) ? String(target.command.dropFirst(prefix.count)) : target.command
+    }
     static func shellWords(_ text: String) -> [String]? {
         guard let regex = try? NSRegularExpression(pattern: #"(?:[^\s"'\\]+|"(?:[^"\\]|\\.)*"|'[^']*')+"#) else { return nil }
         let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
@@ -397,20 +483,9 @@ enum ProjectProfiles {
         }
         return text[cursor...].allSatisfy(\.isWhitespace) ? values : nil
     }
-    static func desktopRoots() -> [String] {
-        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Coding")
-        return ((try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []).filter { directory in
-            guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return false }
-            let fm = FileManager.default
-            if fm.fileExists(atPath: directory.appendingPathComponent("Info.plist").path) || fm.fileExists(atPath: directory.appendingPathComponent("Package.swift").path) { return directory.lastPathComponent != "DevBar" }
-            let json = json(directory.appendingPathComponent("package.json")) ?? [:]
-            let dependencies = (json["dependencies"] as? [String: Any] ?? [:]).merging(json["devDependencies"] as? [String: Any] ?? [:]) { a, _ in a }
-            return dependencies["electron"] != nil || dependencies["@tauri-apps/cli"] != nil
-        }.map(\.path)
-    }
     static func selected(_ project: SavedProject) -> LaunchTarget? {
         let targets = profile(project.path).targets
         if let id = project.targetID { return targets.first { $0.id == id } }
-        return targets.first { $0.command == project.command } ?? targets.first
+        return targets.first { $0.command == project.command } ?? (project.command.isEmpty && targets.count == 1 ? targets.first : nil)
     }
 }

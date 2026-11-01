@@ -2,7 +2,8 @@ import Foundation
 import Darwin
 
 /// Transient user-session jobs: launchd owns command lifetimes, not the GUI.
-/// Desktop apps must still use Launch Services to establish their own identity.
+/// Development commands keep their toolchain's native launch/reload behavior.
+/// Installed desktop applications use Launch Services separately.
 enum LaunchIsolation {
     private static var domain: String { "gui/\(getuid())" }
     private static var directory: URL { ProjectStore().directory.appendingPathComponent("tasks") }
@@ -51,9 +52,13 @@ enum LaunchIsolation {
         "$@"
         exit $?
         """
+        var inherited = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        // A managed command must not advertise the manager's bundle identity.
+        inherited.removeValue(forKey: "__CFBundleIdentifier")
+        inherited.removeValue(forKey: "XPC_SERVICE_NAME")
         let plist: [String: Any] = [
             "Label": label(id), "ProgramArguments": ["/bin/zsh", "-c", script, "DevBar task", task.path, executable] + arguments,
-            "WorkingDirectory": cwd, "EnvironmentVariables": ProcessInfo.processInfo.environment.merging(environment) { _, new in new },
+            "WorkingDirectory": cwd, "EnvironmentVariables": inherited,
             "StandardOutPath": log.path, "StandardErrorPath": (errorLog ?? log).path,
             "RunAtLoad": true, "KeepAlive": false, "ProcessType": "Interactive", "AbandonProcessGroup": true,
             "Umask": 0o077
@@ -92,6 +97,10 @@ enum LaunchIsolation {
 
     static func wait(_ process: LiveProcess) -> Int {
         while CommandExecution.alive(process) { CommandExecution.pump() }
+        if let id = process.launchID, FileManager.default.fileExists(atPath: folder(id).appendingPathComponent("terminal").path) {
+            let deadline = Date().addingTimeInterval(2)
+            while exitCode(process) == nil && Date() < deadline { CommandExecution.pump(0.05) }
+        }
         let code = exitCode(process) ?? 143
         cleanup(process)
         return code
@@ -99,7 +108,9 @@ enum LaunchIsolation {
 
     static func cleanup(_ process: LiveProcess) {
         guard let id = process.launchID, UUID(uuidString: id) != nil, !CommandExecution.alive(process) else { return }
-        _ = try? control(["bootout", domain + "/" + label(id)], required: false)
+        if FileManager.default.fileExists(atPath: folder(id).appendingPathComponent("terminal").path) {
+            guard exitCode(process) != nil else { return }
+        } else { _ = try? control(["bootout", domain + "/" + label(id)], required: false) }
         try? FileManager.default.removeItem(at: folder(id))
     }
 

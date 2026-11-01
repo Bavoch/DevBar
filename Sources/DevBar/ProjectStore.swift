@@ -51,11 +51,40 @@ struct ProjectStore {
     func load() throws -> [SavedProject] {
         let file = directory.appendingPathComponent("projects.json")
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
-        do { return try JSONDecoder().decode([SavedProject].self, from: Data(contentsOf: file)) }
-        catch { throw failure("项目配置无法读取，请检查 projects.json") }
+        do {
+            guard try file.resourceValues(forKeys: [.fileSizeKey]).fileSize.map({ $0 <= 4_194_304 }) == true else {
+                throw failure("项目列表过大")
+            }
+            guard let data = ProjectProfiles.data(file, limit: 4_194_304) else { throw failure("项目列表无法读取") }
+            var entries = try JSONDecoder().decode([SavedProject].self, from: data)
+            var ids = Set<String>(), paths = Set<String>()
+            for index in entries.indices {
+                try Self.validate(entries[index])
+                entries[index].path = URL(fileURLWithPath: entries[index].path).standardizedFileURL.resolvingSymlinksInPath().path
+                if ProjectProfiles.isApplicationBundlePath(entries[index].path) { continue }
+                guard ids.insert(entries[index].id).inserted, paths.insert(entries[index].path).inserted else {
+                    throw failure("项目列表含有重复项目")
+                }
+            }
+            // Ignore legacy auto-discovered bundle folders. A later save rewrites
+            // the list without them; reading alone preserves the original file.
+            return entries.filter { !ProjectProfiles.isApplicationBundlePath($0.path) }
+        } catch { throw failure("项目列表无法读取，原文件已保留：\(file.path)") }
+    }
+
+    private static func validate(_ project: SavedProject) throws {
+        guard project.id.range(of: #"^[A-Za-z0-9_-]{1,128}$"#, options: .regularExpression) != nil,
+              !project.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              project.path.hasPrefix("/"), !project.path.contains("\n"),
+              ![project.path, project.name, project.command].contains(where: { $0.contains("\0") }),
+              project.targetID?.contains("\n") != true else { throw failure("项目记录无效") }
     }
 
     func save(_ project: SavedProject) throws {
+        try Self.validate(project)
+        guard !ProjectProfiles.isApplicationBundlePath(project.path) else {
+            throw failure("不能添加应用包或其内部目录，请选择源码项目目录")
+        }
         var isDirectory: ObjCBool = false
         guard !project.name.isEmpty, FileManager.default.fileExists(atPath: project.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw failure("请选择有效的项目目录")
@@ -80,9 +109,18 @@ struct ProjectStore {
         catch { throw failure("项目移除记录无法读取") }
     }
 
+    func visible(_ projects: [Project]) throws -> [Project] {
+        let excluded = try excludedPaths()
+        return projects.filter { !excluded.contains($0.path) && !ProjectProfiles.isApplicationBundlePath($0.path) }
+    }
+
     func remove(_ id: String) throws {
         try locked {
             let entries = try load()
+            let table = try ProcessTable.read()
+            guard !runs(id).contains(where: { ProjectRunner.active($0, path: entries.first(where: { $0.id == id })?.path ?? "", table: table) }) else {
+                throw failure("请先停止项目，再移除")
+            }
             var excluded = try excludedPaths()
             if let project = entries.first(where: { $0.id == id }) { excluded.insert(project.path) }
             // Persist the opt-out first so a concurrent scan cannot undo removal.
@@ -98,6 +136,7 @@ struct ProjectStore {
             var paths = Set(entries.map(\.path))
             var changed = false
             for project in projects where project.processes.contains(where: \.canStop) || project.session != nil {
+                guard !ProjectProfiles.isApplicationBundlePath(project.path) else { continue }
                 let config = SavedProject(name: project.name, path: project.path, command: Self.suggestion(project.path))
                 guard !paths.contains(config.path), !excluded.contains(config.path), !(directory.standardizedFileURL == FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/DevBar").standardizedFileURL && Self.isOwnWorkspace(config.path)) else { continue }
                 var isDirectory: ObjCBool = false
@@ -163,6 +202,20 @@ struct ProjectStore {
         }
     }
 
+    func logIssue(path: String, error: Error) {
+        guard let project = try? load().first(where: { $0.path == path }) else { return }
+        try? prepare()
+        let url = logURL(project.id)
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { return }
+        let line = "\nDevBar [" + ISO8601DateFormatter().string(from: Date()) + "]: " + String(error.localizedDescription.prefix(8_192)) + "\n"
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        try? handle.write(contentsOf: Data(line.utf8))
+    }
+
     func write<T: Encodable>(_ value: T, to file: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -177,7 +230,7 @@ struct ProjectStore {
     }
 
     static func suggestion(_ path: String) -> String {
-        ProjectProfiles.profile(path).targets.first?.command ?? ""
+        ProjectProfiles.profile(path).targets.first(where: { $0.kind != .tool && $0.environmentIssue == nil })?.command ?? ""
     }
 }
 

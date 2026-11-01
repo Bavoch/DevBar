@@ -1,13 +1,13 @@
 import Foundation
 
-/// 面板徽章只表达用户能据此行动的事实，状态只来自两个可信来源：
-/// 开发会话（监视 + 自动重启）与受管目标回执；不再做内容指纹启发式猜测。
+/// 面板只读取存活会话的运行阶段，不执行内容指纹或版本探针。
 struct RuntimeFreshness: Codable, Equatable {
-    enum State: String, Codable { case current, stale, failed, unknown }
+    enum State: String, Codable { case starting, current, stale, failed, unknown }
     let state: State
     let reason: String
     var title: String {
         switch state {
+        case .starting: return "启动中"
         case .current: return "运行中"
         case .stale: return "源码已变"
         case .failed: return "运行失败"
@@ -18,13 +18,20 @@ struct RuntimeFreshness: Codable, Equatable {
 }
 
 enum RuntimeFreshnessInspector {
-    /// 状态推导的唯一入口：会话存活即最新（会话自己负责加载最新源码），
-    /// 其次看非 process 受管目标的回执；两者都没有时不显示徽章。
+    /// A waiting supervisor is not a running project. Aggregate target phases so
+    /// a failed sibling cannot hide a healthy target.
     static func inspect(_ project: Project, persist: Bool) -> RuntimeFreshness? {
-        if let session = DevelopmentRuntime.state(project.path) {
-            return RuntimeFreshness(state: session.phase == .failed ? .failed : .current, reason: session.reason)
+        let sessions = DevelopmentRuntime.states(project.path)
+        if let session = sessions.first(where: { $0.phase == .watching }) {
+            return RuntimeFreshness(state: .current, reason: session.reason)
         }
-        return ManagedSync.freshness(project)
+        if let session = sessions.first(where: { $0.phase == .starting }) {
+            return RuntimeFreshness(state: .starting, reason: session.reason)
+        }
+        if let session = sessions.first {
+            return RuntimeFreshness(state: .failed, reason: session.reason)
+        }
+        return nil
     }
 
     static func verify() {
@@ -38,6 +45,6 @@ enum RuntimeFreshnessInspector {
         precondition(DevelopmentRuntime.state(missing) == nil)
         let project = Project(path: missing, name: "missing", listeners: [], processes: [], entryPoints: [], auxiliaryServices: [])
         precondition(inspect(project, persist: false) == nil)
-        print("PASS: freshness derives from development sessions and managed receipts only, no heuristics")
+        print("PASS: runtime phase derives from live development sessions; panel never runs version probes")
     }
 }

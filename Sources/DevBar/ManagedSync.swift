@@ -110,7 +110,7 @@ enum ManagedSync {
         for key in keys {
             if config.targets[key]?.strategy == "process" {
                 if let state = DevelopmentRuntime.state(root, target: key, exact: true), state.phase != .failed {
-                    return RuntimeFreshness(state: .current, reason: state.reason)
+                    return RuntimeFreshness(state: state.phase == .starting ? .starting : .current, reason: state.reason)
                 }
                 continue
             }
@@ -130,7 +130,10 @@ enum ManagedSync {
             guard (try? GroupSync.validate(config, target: target)) != nil else { return false }
             return selected.members?.contains { active(path: path, target: $0) } == true
         }
-        if selected.strategy == "process" { return DevelopmentRuntime.state(path, target: target, exact: true) != nil }
+        if selected.strategy == "process" {
+            guard let state = DevelopmentRuntime.state(path, target: target, exact: true) else { return false }
+            return state.phase != .failed
+        }
         guard let receipt = stored(ProjectSync.canonical(path), target: target) else { return false }
         return receipt.process.map(CommandExecution.alive) ?? false
     }
@@ -142,8 +145,10 @@ enum ManagedSync {
         guard let key = target ?? SyncRouter.singleTarget(path: root, configuration: config), let selected = config.targets[key] else { throw failure("请用 --target 指定已配置的同步目标") }
         if selected.strategy == "group" { return try MainActor.assumeIsolated { try GroupSync.execute(action: "stop", path: root, target: key, planOnly: false) } }
         if selected.strategy == "process" {
-            guard DevelopmentRuntime.state(root, target: key, exact: true) != nil else { throw failure("没有可停止的开发会话") }
-            _ = try ProjectRunner.stop(path: root, store: ProjectStore(), targetID: key)
+            let recorded = DevelopmentRuntime.state(root, target: key, exact: true) != nil
+            guard recorded || config.targets.count == 1 else { throw failure("暂时无法确认该运行方式的进程，请使用项目的停止操作") }
+            let outcome = try ProjectRunner.stop(path: root, store: ProjectStore(), targetID: recorded ? key : nil).outcome
+            if case .stillRunning = outcome { throw failure("项目尚未停止，请稍后重试") }
             return try SyncRouter.encode(ManagedReport(state: "stopped", reason: "已停止开发会话", plan: try? plan(path: root, target: key)), state: "ready")
         }
         guard selected.strategy != nil, selected.strategy != "macBundle" else { throw failure("应用包目标请使用 DevBar 的应用启停操作；stop 命令当前用于受管运行会话") }
@@ -315,14 +320,30 @@ enum ManagedSync {
 
     static func status(path: String, target: String) -> ManagedReport {
         let root = ProjectSync.canonical(path)
-        // process 目标以「开发会话」为事实源：会话存活即最新，退出即失败，无回执。
-        if (try? SyncRouter.configuration(path: root))?.targets[target]?.strategy == "process" {
+        if let config = try? SyncRouter.configuration(path: root), config.targets[target]?.strategy == "process" {
             let current = try? plan(path: root, target: target)
-            if let state = DevelopmentRuntime.state(root, target: target, exact: true) {
-                let mapped: String = state.phase == .failed ? "failed" : "current"
-                return ManagedReport(state: mapped, reason: state.phase == .failed ? state.reason : "开发会话运行中；" + state.reason, plan: current)
+            let state = DevelopmentRuntime.state(root, target: target, exact: true)
+            if let state, state.phase != .failed {
+                return ManagedReport(state: state.phase == .starting ? "starting" : "current", reason: state.phase == .starting ? "启动中" : "运行中", plan: current)
             }
-            return ManagedReport(state: "stopped", reason: "开发会话未运行", plan: current)
+            let found = try? Discovery.scan(knownPaths: [root], light: true, onlyPaths: [root]).first { $0.path == root }
+            if let found, !found.controlProcesses.isEmpty || found.session != nil {
+                if SyncRouter.singleTarget(path: root, configuration: config) == target {
+                    return ManagedReport(state: "current", reason: "运行中", plan: current)
+                }
+                if state == nil { return ManagedReport(state: "unconfirmed", reason: "项目正在运行，请确认所选运行方式", plan: current) }
+            }
+            if let state { return ManagedReport(state: "failed", reason: state.reason, plan: current) }
+            let store = ProjectStore()
+            if let saved = try? store.load().first(where: { $0.path == root }), let run = store.targetRun(saved.id, target) {
+                if let table = try? ProcessTable.read(), ProjectRunner.active(run, path: root, table: table) {
+                    return ManagedReport(state: "starting", reason: "启动中", plan: current)
+                }
+                if let code = ProjectRunner.exitCode(run), ![0, 130, 143].contains(code) {
+                    return ManagedReport(state: "failed", reason: "启动失败，请查看日志", plan: current, log: store.logURL(saved.id).path)
+                }
+            }
+            return ManagedReport(state: "stopped", reason: "已停止", plan: current)
         }
         guard var receipt = stored(root, target: target) else { return ManagedReport(state: "unconfirmed", reason: "尚无此目标的运行版本证据") }
         func result(_ state: String, _ reason: String) -> ManagedReport { ManagedReport(state: state, reason: reason, plan: receipt.plan, receipt: receipt) }
@@ -360,22 +381,21 @@ enum ManagedSync {
         } || found.session.map { !siblingPIDs.contains($0.pid) } == true
     }
 
-    /// process 目标统一走「开发会话」模型：会话自带源码监视与自动重启，
+    /// process 目标统一管理原项目命令的会话：源码监视和热更新由命令自身负责，
     /// sync 只负责确保会话按当前配置在运行；不再做一次性冷启动与版本回执。
     private static func sessionSync(_ plan: ManagedPlan) -> ManagedReport {
         do {
-            if let state = DevelopmentRuntime.state(plan.project, target: plan.target, exact: true), state.phase != .failed {
-                return ManagedReport(state: "current", reason: state.reason.isEmpty ? "开发会话已在运行" : state.reason, plan: plan)
-            }
+            let existing = status(path: plan.project, target: plan.target)
+            if ["current", "starting", "unconfirmed"].contains(existing.state) { return existing }
             let store = ProjectStore()
             // DevBar 记录在案但监督进程已消失的运行，按记录安全清理后再判断。
             if (try? store.load())?.contains(where: { $0.path == plan.project }) == true {
                 _ = try? ProjectRunner.stop(path: plan.project, store: store, targetID: plan.target)
             }
-            // 只提示不动手：目录里已有非 DevBar 启动的进程时，拒绝建立会话。
-            if let found = try Discovery.scan(knownPaths: [plan.project]).first(where: { $0.path == plan.project }),
+            // An ambiguous existing runtime stays intact until a method is selected.
+            if let found = try Discovery.scan(knownPaths: [plan.project], onlyPaths: [plan.project]).first(where: { $0.path == plan.project }),
                found.processes.contains(where: \.canStop) || found.session != nil {
-                return ManagedReport(state: "externalRuntime", reason: "此目录已有外部运行的进程；未结束或接管它们。请先手动停止，再由 sync 建立开发会话。", plan: plan)
+                return ManagedReport(state: "unconfirmed", reason: "项目正在运行，请确认所选运行方式", plan: plan)
             }
             guard let command = plan.startCommand else { throw failure("process 适配器需要前台 startCommand 或 launchTarget") }
             let saved = (try store.load()).first(where: { $0.path == plan.project })
@@ -395,7 +415,7 @@ enum ManagedSync {
                 }
                 CommandExecution.pump(0.2)
             }
-            return ManagedReport(state: "current", reason: "开发会话已启动并仍在初始化；当前状态请用 status 查询", plan: plan)
+            return ManagedReport(state: "starting", reason: "开发会话仍在启动；当前状态请用 status 查询", plan: plan)
         } catch {
             return ManagedReport(state: "failed", reason: error.localizedDescription, plan: plan)
         }
@@ -418,11 +438,11 @@ enum ManagedSync {
             if plan.strategy == "process" { return sessionSync(plan) }
             let existing = status(path: plan.project, target: target)
             if ["current", "runningUnverified"].contains(existing.state) { return existing }
-            var previous = stored(plan.project, target: target)
+            let previous = stored(plan.project, target: target)
             let siblingPIDs = try otherManagedPIDs(plan.project)
             // Do not silently take ownership of independently started targets or their sibling services.
             if plan.strategy != "external", !NativeDrivers.strategies.contains(plan.strategy), previous?.process.map(CommandExecution.alive) != true,
-               let found = try Discovery.scan(knownPaths: [plan.project]).first(where: { $0.path == plan.project }),
+               let found = try Discovery.scan(knownPaths: [plan.project], onlyPaths: [plan.project]).first(where: { $0.path == plan.project }),
                externalConflict(plan, found: found, siblingPIDs: siblingPIDs) {
                 return ManagedReport(state: "externalRuntime", reason: "此目录已有外部运行实例；未结束或接管它。请先停止对应实例，再由 sync 建立受管会话。", plan: plan)
             }

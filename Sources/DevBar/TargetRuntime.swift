@@ -20,21 +20,24 @@ enum TargetRuntime {
     static func sessionURL(_ path: String, target: String? = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"], store: ProjectStore = ProjectStore()) -> URL {
         store.directory.appendingPathComponent("targets/" + key(target.map { path + "\n" + $0 } ?? path) + ".json")
     }
-    static func session(_ path: String, table: [Int: LiveProcess]? = nil, targetOnly: Bool = false) -> TargetSession? {
-        let target = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"]
+    static func session(_ path: String, table: [Int: LiveProcess]? = nil, targetOnly: Bool = false,
+                        target: String? = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"]) -> TargetSession? {
         let folder = ProjectStore().directory.appendingPathComponent("targets")
-        let files = target == nil && !targetOnly ? [sessionURL(path)] + ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []) : [sessionURL(path)]
+        let files = target == nil && !targetOnly ? [sessionURL(path, target: target)] + ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []) : [sessionURL(path, target: target)]
         let processes = table ?? (try? ProcessTable.read()) ?? [:]
         for file in files {
             guard let data = try? Data(contentsOf: file), let value = try? JSONDecoder().decode(TargetSession.self, from: data), value.path == path,
-                  let live = processes[value.pid], live.signature == value.signature, live.uid == Int(getuid()) else { continue }
+                  let live = processes[value.pid], live.signature == value.signature, live.executable == value.executable, live.uid == Int(getuid()) else { continue }
             return value
         }
         return nil
     }
-    static func loadedExtensions(_ command: String) -> [String] {
+    static func loadedExtensions(_ command: String, withinPaths: [String]? = nil) -> [String] {
         guard let range = command.range(of: #"--load-extension=(.+?)(?=\s--|$)"#, options: .regularExpression) else { return [] }
-        return String(command[range]).replacingOccurrences(of: "--load-extension=", with: "").split(separator: ",").map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\"' ")) }.filter { $0.hasPrefix("/") && validExtension(URL(fileURLWithPath: $0)) }
+        return String(command[range]).replacingOccurrences(of: "--load-extension=", with: "").split(separator: ",").map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\"' ")) }.filter { path in
+            path.hasPrefix("/") && (withinPaths?.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) ?? true)
+                && validExtension(URL(fileURLWithPath: path))
+        }
     }
     static func paths() -> [String] {
         let folder = ProjectStore().directory.appendingPathComponent("targets")
@@ -123,6 +126,32 @@ enum TargetRuntime {
         guard let app = simulatorApplication else { throw failure("当前 Xcode 未提供 Simulator，请检查已选择的开发工具。") }
         try run("/usr/bin/open", ["-a", app, "--args", "-CurrentDeviceUDID", device])
     }
+    static func nvmExecutable(_ name: String, version: String = "default") -> String? {
+        let fm = FileManager.default
+        let directory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["NVM_DIR"]
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent(".nvm").path).resolvingSymlinksInPath()
+        var requested = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        for _ in 0..<8 {
+            guard !requested.hasPrefix("/"), !requested.contains(".."), requested.count < 80 else { return nil }
+            let alias = directory.appendingPathComponent("alias/" + requested).resolvingSymlinksInPath()
+            guard alias.path.hasPrefix(directory.path + "/") else { return nil }
+            guard let value = ProjectProfiles.text(alias, limit: 1_024)?.components(separatedBy: .newlines).first,
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { break }
+            requested = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let versions = directory.appendingPathComponent("versions/node")
+        let components = requested.trimmingCharacters(in: CharacterSet(charactersIn: "v")).split(separator: ".").compactMap { Int($0) }
+        let latest = ["node", "stable"].contains(requested)
+        guard latest || requested.range(of: #"^v?[0-9]+(?:\.[0-9]+){0,2}$"#, options: .regularExpression) != nil else { return nil }
+        let choices = ((try? fm.contentsOfDirectory(at: versions, includingPropertiesForKeys: nil)) ?? []).filter { version in
+            let value = version.lastPathComponent.dropFirst().split(separator: ".").compactMap { Int($0) }
+            return version.lastPathComponent.hasPrefix("v") && value.count == 3 && (latest || value.starts(with: components))
+        }.sorted { a, b in
+            a.lastPathComponent.compare(b.lastPathComponent, options: .numeric) == .orderedDescending
+        }
+        return choices.map { $0.appendingPathComponent("bin/" + name).path }.first { fm.isExecutableFile(atPath: $0) }
+    }
+
     static func executable(_ name: String) -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let environment = ProcessInfo.processInfo.environment
@@ -132,6 +161,7 @@ enum TargetRuntime {
         let paths = (environment["PATH"] ?? "").components(separatedBy: ":").filter { !$0.isEmpty }
             + [home + "/.local/bin", home + "/.bun/bin", home + "/.cargo/bin", sdk + "/platform-tools", sdk + "/emulator", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
         return paths.map { URL(fileURLWithPath: $0).appendingPathComponent(name).path }.first { FileManager.default.isExecutableFile(atPath: $0) }
+            ?? (["node", "npm", "npx", "corepack", "pnpm", "yarn"].contains(name) ? nvmExecutable(name) : nil)
     }
     static func hasDependencies(_ directory: URL) -> Bool {
         var directory = directory
@@ -158,6 +188,17 @@ enum TargetRuntime {
             }
         }
         let root = URL(fileURLWithPath: target.directory)
+        let tools = ["node": "Node.js", "npm": "Node.js", "npx": "Node.js", "pnpm": "pnpm", "yarn": "Yarn", "bun": "Bun", "python3": "Python", "uv": "uv", "swift": "Swift", "cargo": "Rust", "go": "Go"]
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let customShellEnvironment = [".zprofile", ".zshenv", ".zlogin"].contains { FileManager.default.fileExists(atPath: home.appendingPathComponent($0).path) }
+        for (tool, label) in tools {
+            let pattern = #"(?:^|&&\s*)(?:exec\s+)?"# + tool + #"(?:\s|$)"#
+            if target.command.range(of: pattern, options: .regularExpression) != nil, executable(tool) == nil, !customShellEnvironment { return "需要安装 " + label + " 后再运行。" }
+        }
+        let nvm = URL(fileURLWithPath: ProcessInfo.processInfo.environment["NVM_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".nvm").path)
+        if FileManager.default.fileExists(atPath: nvm.appendingPathComponent("nvm.sh").path),
+           let version = ProjectProfiles.text(root.appendingPathComponent(".nvmrc"), limit: 1_024)?.components(separatedBy: .newlines).first,
+           nvmExecutable("node", version: version) == nil { return "项目需要的 Node.js 版本尚未安装，请安装后重试。" }
         if target.kind == .web, target.id.hasSuffix("dev:h5"),
            let package = ProjectProfiles.json(root.appendingPathComponent("package.json")),
            let script = (package["scripts"] as? [String: String])?["build:h5"], script.hasPrefix("taro build --type h5") {
@@ -192,21 +233,22 @@ enum TargetRuntime {
         let errors = temporary.appendingPathComponent("stderr")
         let command = ([executable] + arguments).map(ProjectProfiles.quote).joined(separator: " ")
         if ProcessInfo.processInfo.environment["DEVBAR_DEVELOPMENT"] == "1" {
-            // Remain in the development process tree, so a source change or Stop
-            // cancels an in-flight build rather than leaving a launchd job behind.
-            FileManager.default.createFile(atPath: output.path, contents: nil)
-            FileManager.default.createFile(atPath: errors.path, contents: nil)
-            let out = try FileHandle(forWritingTo: output), err = try FileHandle(forWritingTo: errors)
-            defer { try? out.close(); try? err.close() }
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-lc", CommandExecution.bootstrap, "DevBar build", cwd?.path ?? FileManager.default.currentDirectoryPath, command]
-            process.standardOutput = out; process.standardError = err
-            try process.run(); process.waitUntilExit()
-            if process.terminationStatus != 0 {
-                if let data = try? Data(contentsOf: errors) { FileHandle.standardError.write(data) }
-                throw failure("开发构建失败（\(process.terminationStatus)）")
+            // Build scripts are user commands too. Keep them independent of
+            // DevBar's TCC identity while forwarding Stop to their system job.
+            var stopping = false
+            let signals = [SIGTERM, SIGINT].map { number -> (DispatchSourceSignal, sig_t?) in
+                let previous = signal(number, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+                source.setEventHandler { stopping = true }; source.resume()
+                return (source, previous)
             }
+            defer {
+                for (index, item) in signals.enumerated() {
+                    item.0.cancel(); signal([SIGTERM, SIGINT][index], item.1)
+                }
+            }
+            try CommandExecution.run(command: command, directory: cwd?.path ?? FileManager.default.currentDirectoryPath,
+                log: output, environment: [:], timeout: 900, errorLog: errors, cancelled: { stopping })
         } else {
             try CommandExecution.run(command: command, directory: cwd?.path ?? FileManager.default.currentDirectoryPath,
                 log: output, environment: [:], timeout: 900, errorLog: errors)
@@ -363,7 +405,7 @@ enum TargetRuntime {
         if value.kind == .ios, let device = value.device, let bundle = value.bundleID {
             DispatchQueue.global(qos: .userInitiated).async {
                 let result = Result {
-                    guard let live = try ProcessTable.read(value.pid)[value.pid], live.signature == value.signature, live.uid == Int(getuid()) else { throw failure("运行会话已结束") }
+                    guard let live = try ProcessTable.read(value.pid)[value.pid], live.signature == value.signature, live.executable == value.executable, live.uid == Int(getuid()) else { throw failure("运行会话已结束") }
                     try openSimulator(device)
                     try run("/usr/bin/xcrun", ["simctl", "launch", device, bundle])
                 }
@@ -372,7 +414,7 @@ enum TargetRuntime {
                 }
             }
         } else {
-            guard let live = try? ProcessTable.read(value.pid)[value.pid], live.signature == value.signature, live.uid == Int(getuid()) else { completion(failure("运行会话已结束")); return }
+            guard let live = try? ProcessTable.read(value.pid)[value.pid], live.signature == value.signature, live.executable == value.executable, live.uid == Int(getuid()) else { completion(failure("运行会话已结束")); return }
             guard let app = NSRunningApplication(processIdentifier: pid_t(value.pid)), app.activate(options: [.activateIgnoringOtherApps]) else { completion(failure("无法激活此运行会话")); return }
             completion(nil)
         }

@@ -60,6 +60,15 @@ enum ProjectDiagnostics {
         if !rootScripts.isEmpty, ProjectProfiles.manager(root, package: package) == nil {
             issues.append(ProjectIssue(code: "packageManagerUnsupported", severity: "error", message: "项目声明的包管理器尚不受支持。", remedy: "保留项目声明，不自动替换包管理器；显式配置实际运行目标或增加对应适配器。"))
         }
+        if let manager = ProjectProfiles.manager(root, package: package) {
+            let entryNames = ["dev", "start", "serve", "watch", "docs:dev", "dev:desktop", "dev:web", "dev:backend", "dev:worker"]
+            for name in entryNames where rootScripts[name] != nil {
+                do { try DevelopmentRuntime.validate(ProjectProfiles.script(name, manager: manager), root: root) }
+                catch {
+                    issues.append(ProjectIssue(code: "launchCommandRejected", severity: profile.targets.isEmpty ? "error" : "warning", message: "\(name)：\(error.localizedDescription)", remedy: "为本地运行提供 dev/watch 入口；发布、部署和构建预览不作为运行方式。"))
+                }
+            }
+        }
         if ["package:win", "build:win", "dist:win"].contains(where: { rootScripts[$0] != nil }) {
             platforms.insert("WindowsArtifact")
             issues.append(ProjectIssue(code: "crossPlatformAcceptanceRequired", severity: "info", message: "项目包含 Windows 安装包／便携包产物，macOS 不能替代其运行验收。", remedy: "使用 windowsSSH 内置驱动连接 Windows OpenSSH 主机；原生驱动需在真实 Windows 验收。"))
@@ -114,6 +123,8 @@ enum ProjectDiagnostics {
             if archived { return TargetCapability(id: target.id, kind: target.kind.rawValue, launch: "notApplicable", synchronization: "notApplicable", verification: "archive excluded from automatic runtime execution", issues: []) }
             var targetIssues: [ProjectIssue] = []
             if let reason = TargetRuntime.environmentIssue(target) { targetIssues.append(ProjectIssue(code: "environmentMissing", severity: "error", message: reason, remedy: "补齐此目标所需工具、依赖或运行时，再重试。")) }
+            do { try DevelopmentRuntime.validate(ProjectProfiles.localCommand(target, owner: root.path), root: URL(fileURLWithPath: target.directory)) }
+            catch { targetIssues.append(ProjectIssue(code: "launchCommandRejected", severity: "error", message: error.localizedDescription, remedy: "选择此项目的本地 dev/watch 运行入口。")) }
             if let package = ProjectProfiles.json(URL(fileURLWithPath: target.directory).appendingPathComponent("package.json")),
                let manager = ProjectProfiles.manager(URL(fileURLWithPath: target.directory), package: package), TargetRuntime.executable(manager) == nil {
                 targetIssues.append(ProjectIssue(code: "packageManagerMissing", severity: "error", message: "未找到 \(manager)", remedy: "安装 packageManager 声明的包管理器；不会擅自切换或安装依赖。"))
@@ -137,8 +148,8 @@ enum ProjectDiagnostics {
             let verification: String
             switch target.kind {
             case .desktop:
-                synchronization = "macBundle / process"
-                verification = "完整应用内容及新进程；开发实例需运行版本探针"
+                synchronization = "process"
+                verification = "受管开发命令与目标应用身份；不自动替换安装版，不证明界面或业务功能正确"
             case .browserExtension:
                 synchronization = "extension"
                 verification = "独立无头 Chromium 实际加载清单／后台，源码与插件内容指纹"
@@ -152,14 +163,14 @@ enum ProjectDiagnostics {
                 synchronization = "process / external"
                 verification = "编译监听与开发工具运行版本分开核对"
             case .staticWeb, .web, .service, .script, .tool:
-                synchronization = "process / external"
-                verification = "新进程与应用版本探针；HTTP 200 或 HMR 模式不足以确认"
+                synchronization = "process"
+                verification = "受管项目命令存活及可核验入口；不证明热更新、业务健康或界面已加载最新代码"
             }
             let mapped = configuredEntries.contains { key, value in
                 key == target.id || value.launchTarget == target.id || value.startCommand == target.command ||
                     (value.strategy == nil || value.strategy == "macBundle") && target.kind == .desktop && target.directory == root.path
             }
-            if !mapped { targetIssues.append(ProjectIssue(code: "syncNotConfigured", severity: "warning", message: "此运行目标尚未配置严格同步。", remedy: "用 devbar init --plan 查看可采用的适配器；配置运行版本证明后再报告 current。")) }
+            if !mapped { targetIssues.append(ProjectIssue(code: "syncNotConfigured", severity: "info", message: "运行由项目命令管理；设备或宿主内的状态需另行核对。", remedy: "如需设备或宿主操作，按实际平台配置专用适配器。")) }
             return TargetCapability(id: target.id, kind: target.kind.rawValue, launch: targetIssues.contains(where: { $0.severity == "error" }) ? "blocked" : "available",
                                     synchronization: synchronization, verification: verification, issues: targetIssues)
         }

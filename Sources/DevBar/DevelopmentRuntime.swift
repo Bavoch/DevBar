@@ -2,78 +2,126 @@ import AppKit
 import Foundation
 import Darwin
 
-/// One development session owns the command and its reload lifecycle. Installation
-/// receipts and .devbar.json never participate in deciding what to run.
+/// One development session observes the original command and its owned processes.
+/// The project owns reloads, application identity, signing and privacy requests.
 enum DevelopmentRuntime {
+    struct CommandExit: LocalizedError {
+        let code: Int
+        var errorDescription: String? { "项目开发命令已退出（\(code)）" }
+    }
+    // Preserve the on-disk "watching" value for running sessions; it denotes
+    // process observation, not a DevBar source watcher.
     enum Phase: String, Codable { case starting, watching, failed }
     struct State: Codable {
         let supervisor: LiveProcess
         let phase: Phase
         let reason: String
+        var child: LiveProcess? = nil
+        var runToken: String? = nil
     }
     static func stateURL(_ path: String, target: String? = ProcessInfo.processInfo.environment["DEVBAR_TARGET_ID"]) -> URL {
         return ProjectStore().directory.appendingPathComponent("development/" + TargetRuntime.key(target.map { path + "\n" + $0 } ?? path) + ".json")
     }
     static func state(_ path: String, target: String? = nil, exact: Bool = false) -> State? {
+        states(path, target: target, exact: exact).first
+    }
+    static func recordedState(_ path: String, target: String?) -> State? {
+        guard let data = ProjectProfiles.data(stateURL(path, target: target)) else { return nil }
+        return try? JSONDecoder().decode(State.self, from: data)
+    }
+    static func states(_ path: String, target: String? = nil, exact: Bool = false) -> [State] {
         let store = ProjectStore()
         let config = (try? store.load())?.first(where: { $0.path == path })
         let targets = config.map { store.runs($0.id).compactMap(\.targetID) } ?? []
         let files: [URL]
         if exact || target != nil { files = [stateURL(path, target: target)] }
         else { files = [stateURL(path, target: nil)] + targets.map({ stateURL(path, target: $0) }) }
-        for file in files {
-            guard let data = try? Data(contentsOf: file), let value = try? JSONDecoder().decode(State.self, from: data),
-                  CommandExecution.alive(value.supervisor) else { continue }
+        let recorded: [State] = Array(Set(files)).sorted(by: { $0.path < $1.path }).compactMap { file in
+            guard let data = ProjectProfiles.data(file), let value = try? JSONDecoder().decode(State.self, from: data) else { return nil }
+            if !CommandExecution.alive(value.supervisor) {
+                guard value.phase == .failed, let config,
+                      store.runs(config.id).contains(where: { $0.token == value.runToken }),
+                      value.child.map({ !CommandExecution.alive($0) }) ?? true else { return nil }
+                return value
+            }
+            if value.phase == .watching, let child = value.child, !CommandExecution.alive(child) {
+                return State(supervisor: value.supervisor, phase: .failed, reason: "运行命令已结束，详情见日志", child: child)
+            }
             return value
         }
-        return nil
+        // Ordinary Terminal launches have no DevBar supervisor or state writer.
+        // Derive command-running status from the verified task receipt instead.
+        let terminal: [State] = (config.map { store.runs($0.id) } ?? []).compactMap { run in
+            if let target, run.targetID != target { return nil }
+            guard let id = run.launchID, UUID(uuidString: id) != nil,
+                  FileManager.default.fileExists(atPath: store.directory.appendingPathComponent("tasks/" + id + "/terminal").path),
+                  let live = try? ProcessTable.read(run.pid)[run.pid], live.signature == run.signature,
+                  live.uid == Int(getuid()), run.exitCode == nil else { return nil }
+            return State(supervisor: live, phase: .watching,
+                reason: "Terminal 中的项目命令运行中；热更新由项目自身负责", runToken: run.token)
+        }
+        return recorded + terminal
     }
-    static func expanded(_ command: String, root: URL, depth: Int = 0) -> String {
+    static func expanded(_ command: String, root: URL, depth: Int = 0, lifecycle: Bool = false) -> String {
         guard depth < 8, let scripts = ProjectProfiles.json(root.appendingPathComponent("package.json"))?["scripts"] as? [String: String] else { return command }
         var result = command
         for key in scripts.keys.sorted(by: { $0.count > $1.count }) {
             let pattern = #"\b(?:npm|pnpm|bun)\s+run\s+['\"]?"# + NSRegularExpression.escapedPattern(for: key) + #"['\"]?(?=\s|$|&&|;)"#
             let yarn = #"\byarn\s+['\"]?"# + NSRegularExpression.escapedPattern(for: key) + #"['\"]?(?=\s|$|&&|;)"#
             if result.range(of: pattern, options: .regularExpression) != nil || result.range(of: yarn, options: .regularExpression) != nil {
-                let script = expanded(scripts[key]!, root: root, depth: depth + 1)
+                let script = expanded(scripts[key]!, root: root, depth: depth + 1, lifecycle: lifecycle)
                 let source = key == "build" || key.hasPrefix("build:") || key == "preview" || key.hasPrefix("preview:") ? "__development_build_output__ " + script : script
-                result = result.replacingOccurrences(of: pattern, with: NSRegularExpression.escapedTemplate(for: source), options: .regularExpression)
-                result = result.replacingOccurrences(of: yarn, with: NSRegularExpression.escapedTemplate(for: source), options: .regularExpression)
+                let hooks = lifecycle ? ["pre" + key, "post" + key].compactMap { scripts[$0] }.map { expanded($0, root: root, depth: depth + 1, lifecycle: true) } : []
+                let replacement = ([source] + hooks).joined(separator: " ; ")
+                result = result.replacingOccurrences(of: pattern, with: NSRegularExpression.escapedTemplate(for: replacement), options: .regularExpression)
+                result = result.replacingOccurrences(of: yarn, with: NSRegularExpression.escapedTemplate(for: replacement), options: .regularExpression)
             }
         }
         return result
     }
-    static func ownsWatcher(_ command: String, root: URL) -> Bool {
-        let text = expanded(command, root: root)
-        if text.contains("--no-watch") { return false }
-        // One HMR member does not prove that every member of a composite
-        // frontend/backend command reloads. Restart the complete owned session.
-        if ["concurrently", "run-p ", "&&", " & "].contains(where: text.contains) { return false }
-        let package = ProjectProfiles.json(root.appendingPathComponent("package.json")) ?? [:]
-        let deps = (package["dependencies"] as? [String: Any] ?? [:]).merging(package["devDependencies"] as? [String: Any] ?? [:]) { a, _ in a }
-        // Vite may reload the renderer while a plain Electron main process stays
-        // stale. Only integrated Electron development tools own the whole cycle.
-        if deps["electron"] != nil && !["electron-vite", "electron-webpack", "electron-forge"].contains(where: text.contains) { return false }
-        // Match actual development tools, not a script merely named "dev".
-        let patterns = [#"\btauri\s+dev\b"#, #"\bvite(?:\.js)?(?=\s|$)(?!\s+(?:build|preview)\b)"#,
-            #"\b(?:next|astro|nuxt|remix|electron-vite|electron-webpack)\s+dev\b"#,
-            #"\b(?:nodemon|tsx\s+watch|node\s+--watch|cargo\s+watch|watchexec)\b"#,
-            #"(?:^|\s)--reload(?:\s|=|$)"#, #"\b(?:expo|react-native|electron-forge)\s+start\b"#,
-            #"\b(?:ng\s+serve|wrangler\s+dev|django.*runserver|manage\.py['\"]?\s+runserver)\b"#]
-        return patterns.contains { text.range(of: $0, options: .regularExpression) != nil }
-    }
     static func validate(_ command: String, root: URL) throws {
-        let text = expanded(command, root: root)
-        // The bundled DevBar CLI is itself inside an .app, but --run-target
-        // builds from source. Do not confuse this exact generated invocation
-        // with running a prebuilt product executable.
+        let text = expanded(command, root: root, lifecycle: true)
+        var quote: Character?, escaped = false
+        let characters = Array(text)
+        for (index, character) in characters.enumerated() {
+            if escaped { escaped = false; continue }
+            if character == "\\", quote != "'" { escaped = true; continue }
+            if let active = quote {
+                if character == active { quote = nil }
+                continue
+            }
+            if character == "'" || character == "\"" { quote = character; continue }
+            if character == "&" {
+                let before = index > 0 ? characters[index - 1] : " "
+                let after = index + 1 < characters.count ? characters[index + 1] : " "
+                if before != "&", before != ">", after != "&", after != ">" {
+                    throw failure("请使用前台运行命令，移除命令末尾的 & 后重试")
+                }
+            }
+        }
+        if text.range(of: #"(?:^|[;&|]\s*)(?:exec\s+)?(?:nohup|disown|setsid)(?:\s|$)"#, options: .regularExpression) != nil {
+            throw failure("此命令会脱离运行管理，请使用项目的前台运行命令")
+        }
+        let remote = [
+            #"\b(?:npm|pnpm|yarn|bun)\s+(?:publish|deploy)\b"#,
+            #"\b(?:npm|pnpm|bun)\s+run\s+['\"]?(?:deploy|publish|release)(?::[^\s'\"]+)?(?:['\"]?\s|['\"]?$)"#,
+            #"\b(?:wrangler|vercel|netlify|firebase|supabase|fly(?:ctl)?|serverless|sls|cf|shopify)\s+(?:deploy|publish|release|push|delete|destroy)\b"#,
+            #"\b(?:terraform|pulumi)\s+(?:apply|destroy|up)\b"#,
+            #"\bgit\s+(?:push|reset\s+--hard|clean\s+-[^\s]*f)\b"#,
+            #"\bdocker\s+system\s+prune\b"#
+        ]
+        if remote.contains(where: { command.range(of: $0, options: .regularExpression) != nil || text.range(of: $0, options: .regularExpression) != nil }) {
+            throw failure("此命令包含发布、部署或删除操作，请选择本地运行命令")
+        }
+        // Native/build adapters remain explicit tools, never an automatically
+        // substituted development entry for an ordinary project Start.
         if let words = ProjectProfiles.shellWords(command), [6, 7].contains(words.count),
            words[0] == "exec", URL(fileURLWithPath: words[1]).lastPathComponent == "DevBar",
            words[2] == "--run-target", words[4] == "--target",
-           words.count == 6 || words[6] == "--headless" { return }
-        let installed = [#"(?:^|&&\s*|;\s*)(?:exec\s+)?open\s"#,
-            #"__development_build_output__"#,
-            #"\.app/Contents/MacOS/"#, #"\btauri\s+build\b"#,
+           words.count == 6 || words[6] == "--headless" {
+            throw failure("请设置项目原本的 dev/watch 开发命令；普通启动不使用 DevBar 构建适配器")
+        }
+        let installed = [#"__development_build_output__"#, #"\btauri\s+build\b"#,
             #"\b(?:next\s+(?:start|build)|(?:vite|electron-vite)\s+(?:preview|build)|astro\s+preview|nuxt\s+preview|electron-builder)\b"#,
             #"\b(?:node|bun|tsx)\s+['\"]?(?:\./)?(?:dist|out|build|dist-server|\.next/standalone)/"#,
             #"\bserve\s+(?:-s\s+)?['\"]?(?:\./)?(?:dist|out|build)(?:['\"]?\s|['\"]?$)"#,
@@ -86,54 +134,83 @@ enum DevelopmentRuntime {
         }
     }
 
-    static func snapshot(_ root: URL) throws -> [String: String] {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
-        // 目录级错误（权限、断链等）跳过该子树继续枚举，不让整次快照失败。
-        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in true }) else {
-            throw failure("无法监听项目源码目录")
-        }
-        var result: [String: String] = [:]
-        for case let file as URL in files {
-            let name = file.lastPathComponent
-            if ProjectSync.ignored.contains(name) || (name.hasSuffix(".xcodeproj") && FileManager.default.fileExists(atPath: root.appendingPathComponent("project.yml").path)) || name.hasPrefix("target-") || name.hasPrefix(".devbar-") || name.hasSuffix(".app") || [".log", ".pid", ".sqlite", ".sqlite-wal", ".sqlite-shm"].contains(where: name.hasSuffix) {
-                files.skipDescendants(); continue
-            }
-            let value: URLResourceValues
-            do { value = try file.resourceValues(forKeys: keys) }
-            catch {
-                // Editors routinely replace files with an atomic rename while
-                // this snapshot is being collected. The next pass sees it.
-                if !FileManager.default.fileExists(atPath: file.path) { continue }
-                throw error
-            }
-            // Do not follow links into dependencies, user data or other projects.
-            if value.isSymbolicLink == true { files.skipDescendants(); continue }
-            guard value.isRegularFile == true else { continue }
-            let relative = String(file.path.dropFirst(root.path.count + 1))
-            result[relative] = "\(value.fileSize ?? 0):\(value.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-            if result.count > 200_000 { throw failure("源码监听范围过大，请缩小到具体应用目录") }
-        }
-        return result
+    enum ReadyCheck { case process, endpoint, session, executable, application }
+
+    static func launchContext(_ command: String, root: URL) -> (String, URL) {
+        let directory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["DEVBAR_TARGET_DIRECTORY"] ?? root.path)
+        let target = LaunchTarget(id: "", title: "", kind: .script, directory: directory.path, command: command)
+        return (ProjectProfiles.localCommand(target, owner: root.path), directory)
     }
 
-    /// 监视只是会话的增强能力：快照失败时降级为不监视，绝不能因此终止开发命令。
-    static func safeSnapshot(_ root: URL) -> [String: String]? {
-        do { return try snapshot(root) } catch { return nil }
+    static func readiness(_ command: String, kind: LaunchTarget.Kind?, root: URL) -> ReadyCheck {
+        let (command, directory) = launchContext(command, root: root)
+        let words = ProjectProfiles.shellWords(command) ?? []
+        if words.contains("--run-target"), kind.map({ [.desktop, .ios, .browserExtension].contains($0) }) == true { return .session }
+        let expanded = expanded(command, root: directory)
+        if expanded.range(of: #"(?:^|[\s/])(?:swift|cargo|go)\s+run\b"#, options: .regularExpression) != nil { return .executable }
+        if kind == .web || kind == .staticWeb { return .endpoint }
+        if kind == .desktop { return .application }
+        return .process
     }
-    static func stopSession(_ path: String) throws {
-        guard let session = TargetRuntime.session(path, targetOnly: true), let live = try ProcessTable.read(session.pid)[session.pid] else { return }
-        try CommandExecution.stop(live, force: true)
+
+    static func ready(_ check: ReadyCheck, path: String, child: LiveProcess, products: Set<String> = []) -> Bool {
+        if check == .process { return CommandExecution.alive(child) }
+        if check == .session { return TargetRuntime.session(path, targetOnly: true) != nil }
+        guard let processes = try? CommandExecution.descendants(child), !processes.isEmpty else { return false }
+        if check == .application {
+            if TargetRuntime.session(path, targetOnly: true) != nil { return true }
+            let ids = Set(processes.map(\.pid))
+            return DesktopApplications.candidates().contains { ids.contains($0.pid) && !$0.executable.contains("/Frameworks/") }
+        }
+        if check == .executable {
+            let compilers: Set<String> = ["swift", "swiftc", "swift-frontend", "swift-build", "swift-run", "cargo", "rustc", "go", "compile", "link", "clang", "clang++", "cc", "gcc", "ld", "build-script-build"]
+            return processes.contains { process in
+                let executable = URL(fileURLWithPath: process.executable).resolvingSymlinksInPath().path
+                let name = URL(fileURLWithPath: executable).lastPathComponent
+                let local = executable.hasPrefix(path + "/")
+                let swift = local && executable.contains("/.build/") && !executable.contains("/.build/plugins/") && (products.isEmpty || products.contains(name))
+                let rust = local && executable.contains("/target/") && !executable.contains("/debug/build/") && !executable.contains("/release/build/")
+                return !compilers.contains(name) && (swift || rust || executable.contains("/go-build") && executable.contains("/exe/"))
+            }
+        }
+        let ids = processes.map { String($0.pid) }.joined(separator: ",")
+        guard let text = try? Discovery.run("/usr/sbin/lsof", ["-nP", "-a", "-p", ids, "-iTCP", "-sTCP:LISTEN", "-Fpcn"]),
+              let arguments = try? Discovery.run("/bin/ps", ["-ww", "-p", ids, "-o", "pid=,args="]) else { return false }
+        var commands: [Int: String] = [:]
+        for line in arguments.split(separator: "\n") {
+            let values = line.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+            if values.count == 2, let pid = Int(values[0]) { commands[pid] = String(values[1]) }
+        }
+        return Discovery.parseListeners(text).contains { listener in
+            guard let process = processes.first(where: { $0.pid == listener.pid }),
+                  Discovery.classify(commands[listener.pid] ?? "", executable: process.executable).0 == .project,
+                  !EntryPointSelector.debugPorts(commands[listener.pid] ?? "").contains(listener.port) else { return false }
+            return LocalWebProbe.inspect(listener).kind != .unknown
+        }
     }
+
+    /// Observe the original development command; never implement its reload loop.
     static func run(path: String, command: String) throws {
-        // 命令合法性由调用方把关：面板入口在 ProjectRunner.start 校验；
-        // sync 的 .devbar.json 属显式配置，直接执行。
         let root = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard let identity = try ProcessTable.read(Int(getpid()))[Int(getpid())] else { throw failure("无法记录开发会话") }
         let file = stateURL(root.path)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let log = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".log")
+        guard FileManager.default.createFile(atPath: log.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw failure("无法创建开发日志") }
+        let output = try FileHandle(forReadingFrom: log)
+        defer { try? output.close(); try? FileManager.default.removeItem(at: log) }
+        var child: LiveProcess?
         func record(_ phase: Phase, _ reason: String) throws {
-            try ProjectStore().write(State(supervisor: identity, phase: phase, reason: reason), to: file)
+            try ProjectStore().write(State(supervisor: identity, phase: phase, reason: reason, child: child,
+                runToken: ProcessInfo.processInfo.environment["DEVBAR_RUN_TOKEN"]), to: file)
             print("DevBar: " + reason); fflush(stdout)
+        }
+        func drain() throws {
+            // Bounded reads keep Stop responsive during noisy compiler output.
+            for _ in 0..<16 {
+                guard let data = try output.read(upToCount: 256 * 1024), !data.isEmpty else { break }
+                try FileHandle.standardOutput.write(contentsOf: data)
+            }
         }
         var stopping = false
         let signals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
@@ -141,70 +218,42 @@ enum DevelopmentRuntime {
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
             source.setEventHandler { stopping = true }; source.resume(); return source
         }
-        defer { signals.forEach { $0.cancel() }; try? FileManager.default.removeItem(at: file) }
-        var process: Process?
-        var child: LiveProcess?
-        func stopChild() throws {
-            // Native launchers record apps which Launch Services reparents away
-            // from the command. Stop exactly that recorded identity as well.
-            try stopSession(root.path)
-            if let child { try CommandExecution.stop(child, force: true) }
-            process?.waitUntilExit(); process = nil; child = nil
+        defer { signals.forEach { $0.cancel() } }
+        // The command runs in its own system job, with no DevBar executable
+        // in its ancestry. Do not inject runners, signing or framework settings.
+        try record(.starting, "正在启动项目开发命令…")
+        child = try LaunchIsolation.spawn(executable: "/bin/zsh",
+            arguments: ["-lc", CommandExecution.bootstrap, "DevBar development", root.path, command],
+            directory: root.path, log: log, errorLog: nil,
+            environment: ["DEVBAR_PROJECT_PATH": root.path, "DEVBAR_DEVELOPMENT": "1"])
+        defer {
+            if let child { try? CommandExecution.stop(child, force: true) }
+            try? drain()
+            if stopping { try? FileManager.default.removeItem(at: file) }
         }
-        defer { try? stopChild() }
-        let nativeWatcher = ownsWatcher(command, root: root) || command.contains("live-static.py")
-        let flutter = expanded(command, root: root).range(of: #"\bflutter\s+run\b"#, options: .regularExpression) != nil
-        var input: Pipe?
-        func start() throws {
-            try record(.starting, "正在启动开发会话…")
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            task.arguments = ["-lc", CommandExecution.bootstrap, "DevBar development", root.path, command]
-            task.currentDirectoryURL = root
-            task.environment = ProcessInfo.processInfo.environment.merging(["DEVBAR_PROJECT_PATH": root.path, "DEVBAR_DEVELOPMENT": "1"]) { _, new in new }
-            task.standardOutput = FileHandle.standardOutput; task.standardError = FileHandle.standardError
-            if flutter { let pipe = Pipe(); input = pipe; task.standardInput = pipe }
-            else { task.standardInput = FileHandle.nullDevice }
-            try task.run(); process = task
-            child = try ProcessTable.read(Int(task.processIdentifier))[Int(task.processIdentifier)]
-            let watchingReason: String
-            if nativeWatcher { watchingReason = "开发命令运行中；工具链负责监听，实际界面更新尚未核验" }
-            else if watchDisabled { watchingReason = "开发命令运行中；源码监视不可用（项目过大或读取失败），修改后请手动重启会话" }
-            else { watchingReason = "开发命令运行中；源码变化后自动重启，实际界面更新尚未核验" }
-            try record(.watching, watchingReason)
-        }
-        var watchDisabled: Bool
-        var baseline: [String: String]
-        if let initial = safeSnapshot(root) { baseline = initial; watchDisabled = false }
-        else { baseline = [:]; watchDisabled = true }
-        var pending = baseline
-        var changedAt: Date?
-        try start()
-        while !stopping {
-            CommandExecution.pump(0.5)
-            if stopping { break }
-            if let task = process, !task.isRunning {
-                let code = task.terminationStatus
-                try stopChild()
-                var reason = "开发命令已退出（\(code)）；修改源码后自动重试，详情见日志"
-                if let hint = DesktopApplications.installedConflictHint(path: root.path) { reason += "；" + hint }
-                try record(.failed, reason)
-                if let refreshed = safeSnapshot(root) { baseline = refreshed } else { watchDisabled = true }
-                pending = baseline; changedAt = nil
+        let kind = LaunchTarget.Kind(rawValue: ProcessInfo.processInfo.environment["DEVBAR_TARGET_KIND"] ?? "")
+        let check = readiness(command, kind: kind, root: root)
+        let (_, directory) = launchContext(command, root: root)
+        let products = Set(ProjectProfiles.swiftProducts(ProjectProfiles.text(directory.appendingPathComponent("Package.swift")) ?? ""))
+        var awaitingReady = check != .process
+        try record(awaitingReady ? .starting : .watching,
+            awaitingReady ? "项目命令已启动，正在确认运行实例…" : "项目命令运行中；热更新和应用权限由项目自身管理")
+        while let live = child, !stopping {
+            CommandExecution.pump(0.2)
+            try drain()
+            if !CommandExecution.alive(live) {
+                let code = LaunchIsolation.exitCode(live) ?? 143
+                if stopping { break }
+                if code != 0 { try record(.failed, "项目命令已退出（\(code)），详情见日志；可重新启动") }
+                else { try FileManager.default.removeItem(at: file); print("DevBar: 运行完成"); fflush(stdout) }
+                // Preserve the actual failure code for both CLI and run records.
+                if code != 0 { throw CommandExit(code: code) }
+                return
             }
-            // Do not duplicate a framework's filesystem watcher or continuously
-            // traverse large projects while HMR is already managing changes.
-            if (nativeWatcher || watchDisabled) && process != nil { continue }
-            guard let current = safeSnapshot(root) else { watchDisabled = true; continue }
-            if current != pending { pending = current; changedAt = Date() }
-            guard let time = changedAt, Date().timeIntervalSince(time) >= 0.6 else { continue }
-            changedAt = nil
-            guard pending != baseline else { continue }
-            baseline = pending
-            if process == nil { try start() }
-            else if flutter { try input?.fileHandleForWriting.write(contentsOf: Data("r\n".utf8)) }
-            else if !nativeWatcher { try stopChild(); if !stopping { try start() } }
+            if awaitingReady, ready(check, path: root.path, child: live, products: products) {
+                awaitingReady = false
+                try record(.watching, "项目运行实例已确认；热更新和应用权限由项目自身管理")
+            }
         }
-        try stopChild()
     }
 }

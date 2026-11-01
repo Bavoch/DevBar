@@ -39,9 +39,7 @@ enum DesktopApplications {
     }
 
     private static func bundle(_ path: URL, identifier: String? = nil) -> (id: String, executable: String)? {
-        guard path.pathExtension == "app", let size = try? path.appendingPathComponent("Contents/Info.plist").resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size < 512_000, let data = try? Data(contentsOf: path.appendingPathComponent("Contents/Info.plist")),
-              let plist = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any],
+        guard path.pathExtension == "app", let plist = ProjectProfiles.plist(path.appendingPathComponent("Contents/Info.plist")),
               let id = plist["CFBundleIdentifier"] as? String, !id.isEmpty,
               identifier == nil || identifier == id,
               let name = plist["CFBundleExecutable"] as? String, !name.contains("/"), !name.isEmpty,
@@ -58,6 +56,7 @@ enum DesktopApplications {
 
     static func identity(path: String) -> Identity {
         let root = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath()
+        guard ProjectProfiles.externalDeclaration(root) == nil else { return Identity(runtime: nil, identifier: nil, product: root.lastPathComponent) }
         let package = json(root.appendingPathComponent("package.json")) ?? [:]
         let dependencies = (package["dependencies"] as? [String: Any] ?? [:]).merging(package["devDependencies"] as? [String: Any] ?? [:]) { a, _ in a }
         var runtime: String? = dependencies["electron"] != nil ? "Electron" : nil
@@ -68,8 +67,7 @@ enum DesktopApplications {
         product = build["productName"] as? String ?? product
         for name in ["electron-builder.yml", "electron-builder.yaml"] {
             let file = root.appendingPathComponent(name)
-            if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 128_000,
-               let text = try? String(contentsOf: file, encoding: .utf8) {
+            if let text = ProjectProfiles.text(file, limit: 128_000) {
                 id = scalar("appId", text: text) ?? id
                 product = scalar("productName", text: text) ?? product
             }
@@ -81,7 +79,7 @@ enum DesktopApplications {
                 product = config["productName"] as? String ?? (config["package"] as? [String: Any])?["productName"] as? String ?? product
             }
         }
-        if id == nil, let info = NSDictionary(contentsOf: root.appendingPathComponent("Info.plist")) as? [String: Any],
+        if id == nil, let info = ProjectProfiles.plist(root.appendingPathComponent("Info.plist")),
            let bundleID = info["CFBundleIdentifier"] as? String, !bundleID.contains("$(") {
             id = bundleID
             product = info["CFBundleName"] as? String ?? product
@@ -159,12 +157,16 @@ enum DesktopApplications {
                            "src-tauri/target/debug/bundle", "src-tauri/target/release/bundle", ".build/apple/Products"]
         for name in outputRoots {
             let base = root.appendingPathComponent(name)
+            guard base.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") else { continue }
             guard let enumerator = FileManager.default.enumerator(at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { continue }
             var count = 0
             for case let file as URL in enumerator {
                 count += 1
                 if count > 300 { break }
-                if file.pathExtension == "app" { built.append(file); enumerator.skipDescendants() }
+                if file.pathExtension == "app" {
+                    if file.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") { built.append(file) }
+                    enumerator.skipDescendants()
+                }
                 else if file.pathComponents.count - base.pathComponents.count >= 3 { enumerator.skipDescendants() }
             }
         }

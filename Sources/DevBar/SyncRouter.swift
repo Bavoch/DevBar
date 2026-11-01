@@ -47,7 +47,7 @@ enum SyncRouter {
             guard !automatic.isEmpty else { throw failure("未发现可自动核对的目标；请执行 doctor 查看所需设备或宿主。") }
             return AdapterConfiguration(schemaVersion: 1, targets: automatic)
         }
-        let data = try Data(contentsOf: url)
+        guard let data = ProjectProfiles.data(url, limit: 1_048_576) else { throw failure(".devbar.json 必须是项目内可读取的普通文件，且不超过 1MB") }
         guard data.count <= 1_048_576, let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(raw.keys).isSubset(of: ["schemaVersion", "targets", "$schema"]), let targets = raw["targets"] as? [String: [String: Any]], !targets.isEmpty else { throw failure("无效的 .devbar.json：需要非空 targets，且不能包含未知顶层字段") }
         let allowed: Set<String> = ["members", "runtimeWitness", "strategy", "buildCommand", "artifact", "installPath", "bundleIdentifier", "sourcePaths", "exclude", "timeout", "startCommand", "launchTarget", "proofURL", "proofCommand", "syncCommand", "device", "activity", "runtimeProofPath", "entry", "hostExecutable", "browserExecutable", "host", "remoteStage", "remoteArtifact", "executable", "composeFile", "service", "projectName", "dockerContext", "launchMode"]
@@ -174,7 +174,7 @@ enum SyncRouter {
             let artifacts = DesktopApplications.localBuilds(path: chosen.directory, identifier: nil)
             let script = ["scripts/build-app.sh", "scripts/build.sh"].first { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }
             if artifacts.count == 1, let artifact = artifacts.first, let script,
-               let info = NSDictionary(contentsOf: artifact.appendingPathComponent("Contents/Info.plist")) as? [String: Any], let id = info["CFBundleIdentifier"] as? String {
+               let info = ProjectProfiles.plist(artifact.appendingPathComponent("Contents/Info.plist")), let id = info["CFBundleIdentifier"] as? String {
                 strategy = "macBundle"
                 entry = ["strategy": strategy, "buildCommand": "cd " + ProjectProfiles.quote(chosen.directory) + " && zsh " + ProjectProfiles.quote(script),
                          "artifact": artifact.path, "installPath": "~/Applications/" + artifact.deletingPathExtension().lastPathComponent + " Dev.app", "bundleIdentifier": id]
@@ -193,7 +193,7 @@ enum SyncRouter {
             catch { try? FileManager.default.removeItem(at: destination); throw error }
         }
         let envelope: [String: Any] = ["schemaVersion": 1, "state": write ? "configured" : "planned", "configuration": config,
-                                        "reason": strategy == "process" ? "运行方式已识别；需配置 proofURL 或 proofCommand 才能验证最新运行版本。未执行项目。" : "采用独立目标运行会话；未执行构建或启动。"]
+                                        "reason": strategy == "process" ? "运行方式已识别；源码监听由项目开发命令负责。未执行项目。" : "采用独立目标运行会话；未执行构建或启动。"]
         return (String(decoding: try JSONSerialization.data(withJSONObject: envelope, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]), as: UTF8.self), 0)
     }
 }

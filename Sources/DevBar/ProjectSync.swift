@@ -91,7 +91,7 @@ enum ProjectSync {
 
     private static func bundle(_ path: String) throws -> (identifier: String, executable: String) {
         let root = URL(fileURLWithPath: path)
-        let data = try Data(contentsOf: root.appendingPathComponent("Contents/Info.plist"))
+        guard let data = ProjectProfiles.data(root.appendingPathComponent("Contents/Info.plist"), limit: 512_000) else { throw failure("应用信息必须是可读取的普通文件") }
         guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               let id = info["CFBundleIdentifier"] as? String, !id.isEmpty, id != "com.github.Electron",
               let name = info["CFBundleExecutable"] as? String, !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {

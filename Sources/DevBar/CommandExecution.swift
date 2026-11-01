@@ -17,9 +17,17 @@ enum CommandExecution {
       export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
       export PATH="$JAVA_HOME/bin:$PATH"
     fi
-    if [ -s "$HOME/.nvm/nvm.sh" ]; then
-      . "$HOME/.nvm/nvm.sh" --no-use
-      if [ -f .nvmrc ]; then nvm use --silent >/dev/null 2>&1 || exit 126; fi
+    nvm_root="${NVM_DIR:-$HOME/.nvm}"
+    if [ -s "$nvm_root/nvm.sh" ]; then
+      . "$nvm_root/nvm.sh" --no-use
+      node_project="${DEVBAR_TARGET_DIRECTORY:-$1}"
+      if [ -f "$node_project/.nvmrc" ]; then
+        nvm use --silent "$(head -n 1 "$node_project/.nvmrc")" || exit 126
+      elif [ -f "$1/.nvmrc" ]; then
+        nvm use --silent "$(head -n 1 "$1/.nvmrc")" || exit 126
+      elif ! command -v node >/dev/null 2>&1; then
+        nvm use --silent default || exit 126
+      fi
     fi
     eval "$2"
     """
@@ -35,8 +43,9 @@ enum CommandExecution {
     }
 
     static func alive(_ value: LiveProcess) -> Bool {
+        guard value.pid > 1, value.uid == Int(getuid()) else { return false }
         guard let current = try? ProcessTable.read(value.pid)[value.pid] else { return false }
-        return current.signature == value.signature && current.uid == Int(getuid())
+        return current.signature == value.signature && current.uid == value.uid
     }
 
     static func descendants(_ root: LiveProcess) throws -> [LiveProcess] {
@@ -60,14 +69,22 @@ enum CommandExecution {
         while Date() < deadline, targets.contains(where: alive) { pump() }
         if force {
             for target in targets where ProcessTable.matches(target) { kill(pid_t(target.pid), SIGKILL) }
+            let forcedDeadline = Date().addingTimeInterval(1)
+            while Date() < forcedDeadline, targets.contains(where: alive) { pump(0.05) }
+            if targets.contains(where: alive) { throw failure("仍有运行进程未退出，请重试停止") }
         } else if targets.contains(where: alive) { throw failure("运行实例未优雅退出，未强制结束") }
         LaunchIsolation.cleanup(value)
     }
 
-    static func run(command: String, directory: String, log: URL, environment: [String: String], timeout: Double, errorLog: URL? = nil) throws {
+    static func run(command: String, directory: String, log: URL, environment: [String: String], timeout: Double, errorLog: URL? = nil,
+                    cancelled: () -> Bool = { false }) throws {
         let process = try spawn(command: command, directory: directory, log: log, environment: environment, errorLog: errorLog)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            if cancelled() {
+                try stop(process, force: true)
+                throw failure("任务已停止")
+            }
             if !alive(process) {
                 let code = LaunchIsolation.exitCode(process) ?? 143
                 LaunchIsolation.cleanup(process)

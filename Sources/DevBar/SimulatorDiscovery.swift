@@ -9,14 +9,17 @@ enum SimulatorDiscovery {
         lock.lock(); let previous = cached; lock.unlock()
         if let previous, previous.1 == cacheKey, Date().timeIntervalSince(previous.0) < 20 { return previous.2 }
         let fm = FileManager.default
-        let coding = fm.homeDirectoryForCurrentUser.appendingPathComponent("Coding")
-        let roots = ((try? fm.contentsOfDirectory(at: coding, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []).filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-        var candidates = Set(known.map { URL(fileURLWithPath: $0) } + roots)
+        let roots = known.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath() }
+        var candidates = Set(roots)
         for root in roots {
             for name in ["mobile", "ipad", "apps"] {
                 let folder = root.appendingPathComponent(name)
+                guard folder.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") else { continue }
                 candidates.insert(folder)
-                for child in ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []).prefix(20) where (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { candidates.insert(child) }
+                for child in ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []).prefix(20)
+                    where (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true && child.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") {
+                    candidates.insert(child)
+                }
             }
         }
         var mappings: [String: Set<String>] = [:]
@@ -29,8 +32,8 @@ enum SimulatorDiscovery {
             if let expo = ProjectProfiles.json(root.appendingPathComponent("app.json"))?["expo"] as? [String: Any], let id = (expo["ios"] as? [String: Any])?["bundleIdentifier"] as? String { add(id, root: root) }
             let files = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []).filter { $0.pathExtension == "xcodeproj" }.map { $0.appendingPathComponent("project.pbxproj") } + [root.appendingPathComponent("project.yml")]
             for file in files {
-                guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 2_000_000,
-                      let text = try? String(contentsOf: file, encoding: .utf8), text.contains("iOS") || text.contains("iphoneos") || text.contains("IPHONEOS_DEPLOYMENT_TARGET") else { continue }
+                guard file.resolvingSymlinksInPath().path.hasPrefix(root.path + "/"),
+                      let text = ProjectProfiles.text(file, limit: 2_000_000), text.contains("iOS") || text.contains("iphoneos") || text.contains("IPHONEOS_DEPLOYMENT_TARGET") else { continue }
                 let pattern = #"PRODUCT_BUNDLE_IDENTIFIER[\"']?\s*(?:=|:)\s*[\"']?([^\s;\"',}]+)"#
                 guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
                 for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
@@ -53,7 +56,7 @@ enum SimulatorDiscovery {
             guard let range = process.executable.range(of: ".app/") else { continue }
             let path = String(process.executable[..<range.upperBound].dropLast())
             let app = URL(fileURLWithPath: path)
-            guard let info = NSDictionary(contentsOf: app.appendingPathComponent("Info.plist")) as? [String: Any],
+            guard let info = ProjectProfiles.plist(app.appendingPathComponent("Info.plist")),
                   let id = info["CFBundleIdentifier"] as? String, let executable = info["CFBundleExecutable"] as? String,
                   URL(fileURLWithPath: process.executable).lastPathComponent == executable, let root = mapping[id],
                   let deviceRange = process.executable.range(of: "/CoreSimulator/Devices/") else { continue }
