@@ -21,7 +21,13 @@ struct Project: Codable {
     var portDetails: [PortAssessment] = []
     var desktop: DesktopTarget? = nil
     var freshness: RuntimeFreshness? = nil
+    var controlProcesses: [LiveProcess] = []
     var session: TargetSession? = nil
+    var isRunning: Bool {
+        if freshness?.state == .failed { return !controlProcesses.isEmpty || hasReadyEndpoint || desktop?.pid != nil || session != nil }
+        if freshness?.state == .starting { return hasReadyEndpoint || desktop?.pid != nil || session != nil }
+        return true
+    }
     var hasReadyEndpoint: Bool { !entryPoints.isEmpty || portDetails.contains { [.api, .service].contains($0.role) } }
     var primaryService: PortAssessment? {
         portDetails.first { $0.role == .api } ?? portDetails.first { $0.role == .service } ?? portDetails.first { $0.role == .unknown }
@@ -44,10 +50,12 @@ struct ProjectProcess: Codable {
     let category: ProcessCategory
     let label: String
     var canStop = false
+    var identity: LiveProcess? = nil
     var name: String { URL(fileURLWithPath: executable).lastPathComponent }
 }
 
 enum Discovery {
+    static let runtimeServices: Set<String> = ["Vite", "Next.js", "Astro", "Wrangler", "Workers", "HTTP 服务", "Uvicorn", "Gunicorn", "Flask", "Go"]
     /// A reparented, control-fd-only embedded worker is not evidence that its host application is running.
     static func orphanedEmbeddedRuntime(executable: String, command: String, parent: Int) -> Bool {
         URL(fileURLWithPath: executable).lastPathComponent.lowercased() == "workerd"
@@ -61,9 +69,35 @@ enum Discovery {
         return String(command[..<range.lowerBound])
     }
 
+    static func scriptPaths(_ command: String, cwd: String) -> [String] {
+        let command = String(command.prefix(32_768))
+        let suffix = #"[^\n]*?\.(?:py|js|mjs|cjs|ts|tsx|rb|php|jar|swift|go)(?=[\s"']|$)"#
+        var candidates: [String] = []
+        for index in command.indices where command[index] == "/" {
+            guard index == command.startIndex || command[command.index(before: index)].isWhitespace || ["\"", "'"].contains(command[command.index(before: index)]) else { continue }
+            if let range = command[index...].range(of: "^" + suffix, options: .regularExpression) { candidates.append(String(command[range])) }
+            if let range = command[index...].range(of: #"^/[^\n]*?/\.venv/bin/[^\s"']+"#, options: .regularExpression) { candidates.append(String(command[range])) }
+            if candidates.count >= 32 { break }
+        }
+        candidates += (ProjectProfiles.shellWords(command) ?? []).filter { value in
+            ["py", "js", "mjs", "cjs", "ts", "tsx", "rb", "php", "jar", "swift", "go"].contains(URL(fileURLWithPath: value).pathExtension)
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { value in
+            let file = URL(fileURLWithPath: value, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true)).standardizedFileURL.resolvingSymlinksInPath()
+            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  seen.insert(file.path).inserted else { return nil }
+            return file.path
+        }
+    }
+
     static func ownsScript(_ command: String, root: String, cwd: String) -> Bool {
         let extensions = [".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".php", ".jar", ".swift"]
-        if command.contains(root + "/"), extensions.contains(where: command.contains) { return true }
+        let pattern = NSRegularExpression.escapedPattern(for: root + "/") + #"[^\n]*?\.(?:py|js|mjs|cjs|ts|tsx|rb|php|jar|swift)(?=[\s"']|$)"#
+        if let range = command.range(of: pattern, options: .regularExpression) {
+            let candidate = URL(fileURLWithPath: String(command[range])).resolvingSymlinksInPath()
+            if candidate.path.hasPrefix(root + "/"), FileManager.default.fileExists(atPath: candidate.path) { return true }
+        }
         for token in command.split(whereSeparator: { $0.isWhitespace }) {
             let value = String(token).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
             guard extensions.contains(where: value.hasSuffix) else { continue }
@@ -88,7 +122,9 @@ enum Discovery {
                      ("chrome-devtools-mcp", "DevTools MCP"), ("playwright-mcp", "Playwright MCP"),
                      ("@playwright/mcp", "Playwright MCP"), ("cua-repl", "浏览器自动化"),
                      ("/cua_node/", "浏览器自动化"), ("@modelcontextprotocol/", "MCP 工具"),
-                     ("/mcp-server", "MCP 工具")]
+                     ("/mcp-server", "MCP 工具"), ("typescript-language-server", "语言服务"),
+                     ("/tsserver.js", "语言服务"), ("/pyright", "语言服务"), ("/pylance", "语言服务"),
+                     ("/jdtls", "语言服务"), ("/rust-analyzer", "语言服务")]
         let canBeTool = ["node", "bun", "bun.exe", "python", "python3", "uv", "uvx", "npx", "npm"].contains(runtime)
             || runtime.hasPrefix("python3.") || runtime.contains("mcp") || executable.contains("/cua_node/")
         if canBeTool {
@@ -102,7 +138,9 @@ enum Discovery {
                         (#"(?:^|[\s/])workerd(?=[\s\"']|$)"#, "Workers"),
                         (#"(?:^|\s)http\.server(?=\s|$)"#, "HTTP 服务"),
                         (#"(?:^|[\s/])uvicorn(?=\s|$)"#, "Uvicorn"),
-                        (#"(?:^|[\s/])gunicorn(?=\s|$)"#, "Gunicorn")]
+                        (#"(?:^|[\s/])gunicorn(?=\s|$)"#, "Gunicorn"),
+                        (#"(?:^|[\s/])flask(?:\s+run|\s+--app)"#, "Flask"),
+                        (#"(?:^|[\s/])go\s+run\b"#, "Go")]
         for (pattern, label) in services where text.range(of: pattern, options: .regularExpression) != nil {
             return (.project, label)
         }
@@ -162,17 +200,18 @@ enum Discovery {
 
     static func projectRoot(_ path: String) -> String? {
         guard path.hasPrefix("/") else { return nil }
+        guard !ProjectProfiles.requiresExplicitDirectorySelection(path) else { return nil }
         if let range = path.range(of: "/DerivedData/") {
             let prefix = String(path[..<range.upperBound])
             let tail = path[range.upperBound...].split(separator: "/").first.map(String.init) ?? ""
             let info = URL(fileURLWithPath: prefix + tail).appendingPathComponent("info.plist")
-            if let data = try? Data(contentsOf: info),
+            if let data = ProjectProfiles.data(info),
                let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
                let workspace = plist["WorkspacePath"] as? String {
                 return URL(fileURLWithPath: workspace).deletingLastPathComponent().path
             }
         }
-        var path = path
+        var path = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
         for component in ["/.build/", "/node_modules/", "/.venv/", "/target/", "/build/"] {
             if let range = path.range(of: component) { path = String(path[..<range.lowerBound]) }
         }
@@ -187,7 +226,8 @@ enum Discovery {
         for _ in 0..<16 {
             if directory.path == home || directory.path == "/" { break }
             // Dependencies can carry their own manifests; retain the owning project.
-            if !directory.path.contains("/node_modules"), !directory.path.contains("/.venv"),
+            if !ProjectProfiles.isApplicationBundlePath(directory.path),
+               !directory.path.contains("/node_modules"), !directory.path.contains("/.venv"),
                markers.contains(where: { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }) {
                 if directory.lastPathComponent == "src-tauri" {
                     let parent = directory.deletingLastPathComponent()
@@ -204,7 +244,9 @@ enum Discovery {
     /// only need process identity, `canStop`, desktop and session targets (e.g.
     /// stopping a project) use this to avoid the ~2s port-probe cost of a full
     /// scan, so the stop button responds quickly.
-    static func scan(knownPaths: [String] = [], light: Bool = false) throws -> [Project] {
+    static func scan(knownPaths: [String] = [], light: Bool = false, onlyPaths: [String]? = nil) throws -> [Project] {
+        let scope = onlyPaths.map { Set($0.map { ProjectSync.canonical($0) }) }
+        let knownPaths = (scope.map { $0.sorted() } ?? knownPaths).filter { !ProjectProfiles.isApplicationBundlePath($0) }
         let raw = try run("/usr/sbin/lsof", ["-nP", "-a", "-u", NSUserName(), "-iTCP", "-sTCP:LISTEN", "-Fpcn"])
         let listeners = parseListeners(raw)
         let rawProcesses = try run("/bin/ps", ["-U", NSUserName(), "-o", "pid=,ppid=,comm="])
@@ -238,10 +280,9 @@ enum Discovery {
         for _ in 0..<32 {
             var changed = false
             for pid in parents.keys where categories[pid] != .tool {
-                let serviceNames = ["Vite", "Next.js", "Astro", "Wrangler", "Workers", "HTTP 服务", "Uvicorn", "Gunicorn"]
                 if let parent = parents[pid], categories[parent] == .tool,
                    !["Codex", "Kilo", "WorkBuddy", "OMP", "Claude", "DSH"].contains(labels[parent] ?? ""),
-                   !serviceNames.contains(labels[pid] ?? "") {
+                   !runtimeServices.contains(labels[pid] ?? "") {
                     categories[pid] = .tool; labels[pid] = labels[parent]; changed = true
                 }
             }
@@ -262,7 +303,7 @@ enum Discovery {
         func resolve(_ path: String) -> String? {
             if let root = rootCache[path] { return root }
             if noRoot.contains(path) { return nil }
-            if let root = knownPaths.sorted(by: { $0.count > $1.count }).first(where: { path == $0 || path.hasPrefix($0 + "/") }) ?? projectRoot(path) {
+            if let root = knownPaths.sorted(by: { $0.count > $1.count }).first(where: { path == $0 || path.hasPrefix($0 + "/") }) ?? (scope == nil ? projectRoot(path) : nil) {
                 rootCache[path] = root; return root
             }
             noRoot.insert(path)
@@ -284,13 +325,31 @@ enum Discovery {
         let pids = processes.map { String($0.pid) }.joined(separator: ",")
         let directories = processes.isEmpty ? [:] : parseDirectories(try run("/usr/sbin/lsof", ["-a", "-p", pids, "-d", "cwd", "-Fn"]))
         var grouped: [String: [ProjectProcess]] = [:]
+        var strongProcesses = Set<Int>()
         for var process in processes {
-            guard let root = resolve(process.executable) ?? directories[process.pid].flatMap(resolve) else { continue }
-            let sourceExecutable = process.executable.hasPrefix(root + "/")
+            let cwd = directories[process.pid] ?? "/"
+            let scripts = scriptPaths(commands[process.pid] ?? "", cwd: cwd)
+            let sourceRoot = scripts.compactMap { source -> String? in
+                knownPaths.sorted(by: { $0.count > $1.count }).first(where: { source.hasPrefix($0 + "/") })
+                    ?? projectRoot(URL(fileURLWithPath: source).deletingLastPathComponent().path)
+            }.first
+            let usesWorkingDirectory = runtimeServices.subtracting(["Go"]).contains(process.label)
+            let root: String
+            if let sourceRoot, !usesWorkingDirectory {
+                guard scope?.contains(sourceRoot) ?? true else { continue }
+                root = sourceRoot
+            } else {
+                guard let value = resolve(process.executable) ?? directories[process.pid].flatMap(resolve)
+                    ?? sourceRoot.flatMap({ scope?.contains($0) ?? true ? $0 : nil }) else { continue }
+                root = value
+            }
+            let sourceExecutable = URL(fileURLWithPath: process.executable).resolvingSymlinksInPath().path.hasPrefix(root + "/")
                 && (!process.executable.contains("/node_modules/") || process.executable.contains(".app/Contents/MacOS/"))
-            let scriptCommand = ownsScript(commands[process.pid] ?? "", root: root, cwd: directories[process.pid] ?? root)
-            let knownService = ["Vite", "Next.js", "Astro", "Wrangler", "Workers", "HTTP 服务", "Uvicorn", "Gunicorn"].contains(process.label)
-            process.canStop = process.category == .project && (listeningPids.contains(process.pid) || sourceExecutable || scriptCommand || knownService)
+            let scriptCommand = scripts.contains(where: { $0.hasPrefix(root + "/") }) || ownsScript(commands[process.pid] ?? "", root: root, cwd: directories[process.pid] ?? root)
+            let knownService = runtimeServices.contains(process.label)
+            let strong = sourceExecutable || scriptCommand || knownService && process.label != "HTTP 服务"
+            process.canStop = process.category == .project && (knownService || strong)
+            if process.canStop && strong { strongProcesses.insert(process.pid) }
             grouped[root, default: []].append(process)
         }
         let liveTable = (try? ProcessTable.read()) ?? [:]
@@ -299,18 +358,20 @@ enum Discovery {
             let executable = executables[pid] ?? ""
             let name = URL(fileURLWithPath: executable).lastPathComponent
             guard ["Chromium", "Google Chrome for Testing"].contains(name), let live = liveTable[pid] else { continue }
-            for directory in TargetRuntime.loadedExtensions(command) {
+            for directory in TargetRuntime.loadedExtensions(command, withinPaths: knownPaths) {
+                if let scope, !scope.contains(where: { directory == $0 || directory.hasPrefix($0 + "/") }) { continue }
                 let root = knownPaths.sorted(by: { $0.count > $1.count }).first { directory == $0 || directory.hasPrefix($0 + "/") } ?? projectRoot(directory) ?? directory
-                guard root.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Coding").path + "/") || knownPaths.contains(root) else { continue }
+                guard knownPaths.contains(root) || projectRoot(directory) == root else { continue }
                 sessions[root] = TargetSession(path: root, targetID: "extension", kind: .browserExtension, pid: pid, signature: live.signature, executable: executable, canStop: false)
             }
         }
         for path in Set(TargetRuntime.paths()).union(knownPaths) {
+            if let scope, !scope.contains(path) { continue }
             if let session = TargetRuntime.session(path, table: liveTable) {
                 sessions[path] = session
             }
         }
-        for session in SimulatorDiscovery.sessions(known: knownPaths, table: liveTable, excluding: Set(sessions.values.map(\.pid))) where sessions[session.path] == nil {
+        for session in SimulatorDiscovery.sessions(known: knownPaths, table: liveTable, excluding: Set(sessions.values.map(\.pid))) where sessions[session.path] == nil && (scope?.contains(session.path) ?? true) {
             sessions[session.path] = session
         }
         for (path, session) in sessions {
@@ -322,8 +383,16 @@ enum Discovery {
         let savedSelections = Dictionary(uniqueKeysWithValues: ((try? ProjectStore().load()) ?? []).map { ($0.path, $0) })
         let selections = savedSelections.filter { $0.value.targetID != nil }
         var desktopTargets: [String: DesktopTarget] = [:]
-        for path in Set(grouped.keys).union(knownPaths).union(ProjectProfiles.desktopRoots()) {
+        for path in Set(grouped.keys).union(knownPaths) {
             if sessions[path] != nil { continue }
+            if !knownPaths.contains(path) {
+                let ids = Set((grouped[path] ?? []).map(\.pid))
+                if let app = applications.first(where: { ids.contains($0.pid) }) {
+                    desktopTargets[path] = DesktopTarget(runtime: "应用", pid: app.pid, executable: app.executable,
+                        launchedAt: app.launchedAt, bundlePath: app.bundlePath, identifier: app.identifier)
+                }
+                continue
+            }
             if let config = selections[path], let target = ProjectProfiles.selected(config), target.kind != .desktop { continue }
             let desktop = DesktopApplications.resolve(path: path, processes: grouped[path] ?? [], commands: commands,
                 directories: directories, candidates: applications)
@@ -345,6 +414,7 @@ enum Discovery {
         }
         if !light { LocalWebProbe.prefetch(candidates) }
         return grouped.compactMap { path, entries -> Project? in
+            guard !ProjectProfiles.isApplicationBundlePath(path) else { return nil }
             guard entries.contains(where: \.canStop) || sessions[path] != nil else { return nil }
             let ids = Set(entries.map(\.pid))
             var projectListeners = listeners.filter { ids.contains($0.pid) }.sorted { ($0.port, $0.pid) < ($1.port, $1.pid) }
@@ -366,9 +436,39 @@ enum Discovery {
                let config = try? ProjectStore().load().first(where: { $0.path == path }),
                let target = ProjectProfiles.selected(config), target.command == config.command,
                [.web, .staticWeb].contains(target.kind) { desktop = nil }
+            let eligible = entries.filter { $0.canStop && $0.category == .project }
+            let strong = eligible.filter { strongProcesses.contains($0.pid) || $0.pid == desktop?.pid || $0.pid == sessions[path]?.pid }
+            var controlled = Set((strong.isEmpty ? eligible : strong).map(\.pid))
+            // Include runtime launchers, never a terminal, IDE or AI parent.
+            for seed in Array(controlled) {
+                var pid = liveTable[seed]?.parent ?? 0
+                for _ in 0..<16 {
+                    guard let parent = liveTable[pid], categories[pid] == .project else { break }
+                    let name = URL(fileURLWithPath: parent.executable).lastPathComponent.lowercased()
+                    guard ["node", "bun", "npm", "npx", "pnpm", "yarn", "uv", "uvicorn", "nodemon", "cargo", "go", "swift"].contains(name)
+                        || ["npm ", "pnpm ", "yarn "].contains(where: { name.hasPrefix($0) }) else { break }
+                    let command = commands[pid] ?? ""
+                    let ownsEntry = ownsScript(command, root: path, cwd: directories[pid] ?? path)
+                    let knownLauncher = runtimeServices.subtracting(["HTTP 服务"]).contains(labels[pid] ?? "")
+                    let packageLauncher = command.range(of: #"(?:^|[\s/])(?:npm(?:-cli\.js)?|pnpm(?:\.[cm]?js)?|yarn(?:\.[cm]?js)?)\s+(?:run\s+)?(?:dev|start|serve|watch)(?:[:\s]|$)"#, options: .regularExpression) != nil
+                    guard ownsEntry || knownLauncher || packageLauncher else { break }
+                    controlled.insert(pid)
+                    pid = parent.parent
+                }
+            }
+            for _ in 0..<32 {
+                let children = liveTable.values.filter { controlled.contains($0.parent) && categories[$0.pid] != .tool }
+                let count = controlled.count
+                controlled.formUnion(children.map(\.pid))
+                if count == controlled.count { break }
+            }
+            let identities = controlled.compactMap { liveTable[$0] }.filter {
+                $0.uid == Int(getuid()) && $0.pid > 1 && $0.pid != Int(getpid())
+                    && URL(fileURLWithPath: $0.executable).lastPathComponent.lowercased() != "devbar"
+            }
             return Project(path: path, name: URL(fileURLWithPath: path).lastPathComponent,
-                    listeners: projectListeners, processes: entries.sorted { $0.pid < $1.pid },
-                    entryPoints: entryPoints, auxiliaryServices: projectListeners.filter { !entrySet.contains($0.port) }, portDetails: details, desktop: desktop, session: sessions[path])
+                    listeners: projectListeners, processes: entries.map { process in var value = process; value.identity = liveTable[process.pid]; return value }.sorted { $0.pid < $1.pid },
+                    entryPoints: entryPoints, auxiliaryServices: projectListeners.filter { !entrySet.contains($0.port) }, portDetails: details, desktop: desktop, controlProcesses: identities, session: sessions[path])
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 }
@@ -391,11 +491,11 @@ struct MenuSnapshot: Codable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private let menu = NSMenu()
     private let panel = ProjectPanelView()
-    private let popover = NSPopover()
+    private let panelWindow = ProjectPanelWindow()
     private let panelDismissal = PanelDismissalMonitor()
     private var timer: Timer?
     private var scanning = false
@@ -409,6 +509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var operations: [String: String] = [:]
     private var messages: [String: String] = [:]
     private var launchDeadlines: [String: Date] = [:]
+    private struct PendingOpen {
+        let token: String
+        let kind: LaunchTarget.Kind?
+        let deadline: Date
+    }
+    private var pendingOpens: [String: PendingOpen] = [:]
     private var lastScanStarted = Date.distantPast
     private var refreshRequested = false
     private var configRevision = 0
@@ -435,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     private var pollInterval: TimeInterval {
-        if !operations.isEmpty || launchDeadlines.values.contains(where: { $0 > Date() }) { return 1 }
+        if !operations.isEmpty || !pendingOpens.isEmpty || launchDeadlines.values.contains(where: { $0 > Date() }) { return 1 }
         return menuOpen ? 3 : 10
     }
 
@@ -445,7 +551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let table = (try? ProcessTable.read()) ?? [:]
         presentation = ProjectPresentation.read(saved: saved, store: store, table: table)
         runs = presentation.runs
-        applyIcons(iconLoader.load(paths: projects.map(\.path) + saved.map(\.path)))
+        applyIcons(iconLoader.load(paths: saved.map(\.path)))
         rebuild()
         return menu.items.map(MenuSnapshot.init)
     }
@@ -453,34 +559,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "运行中的开发项目")
+        // Packaged apps keep SwiftPM resources in Contents/Resources; direct
+        // SwiftPM builds use the generated module bundle beside the executable.
+        let statusResources = Bundle.main.url(forResource: "DevBar_DevBar", withExtension: "bundle")
+            .flatMap { Bundle(url: $0) } ?? Bundle.module
+        let statusIcon = statusResources.url(forResource: "StatusBarIconTemplate", withExtension: "png")
+            .flatMap { NSImage(contentsOf: $0) }
+        statusIcon?.size = NSSize(width: 18, height: 18)
+        statusIcon?.isTemplate = true
+        statusIcon?.accessibilityDescription = "DevBar · 本地项目"
+        item.button?.image = statusIcon
         item.button?.imagePosition = .imageLeading
         item.button?.title = " …"
-        item.button?.toolTip = "DevBar · 本地开发项目"
+        item.button?.toolTip = "DevBar · 本地项目"
+        menu.delegate = self
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
-        menu.delegate = self
-        let controller = NSViewController()
-        controller.view = panel
-        popover.contentViewController = controller
-        popover.behavior = .transient
-        popover.animates = false
-        popover.appearance = NSAppearance(named: .darkAqua)
-        popover.delegate = self
-        panel.onAdd = { [weak self] in self?.addProject() }
-        panel.onRefresh = { [weak self] in self?.refresh() }
-        panel.onMoreMenu = { [weak self] anchor in
-            guard let self else { return }
-            let options = NSMenu()
-            self.add("关于 DevBar…", action: #selector(self.showAbout), to: options)
-            self.add("使用帮助", action: #selector(self.showHelp), to: options)
-            options.addItem(.separator())
-            self.add("退出 DevBar", action: #selector(self.quit), to: options).keyEquivalent = "q"
-            options.popUp(positioning: nil, at: NSPoint(x: 0, y: 34), in: anchor)
-        }
-        panel.onResize = { [weak self] size in self?.popover.contentSize = size }
-        panel.onClose = { [weak self] in self?.popover.performClose(nil) }
-        panel.onQuit = { [weak self] in self?.quit() }
+        preparePanel()
         rebuild()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -493,23 +588,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(wake), name: NSWorkspace.didWakeNotification, object: nil)
     }
 
-    @objc private func togglePanel() {
-        if popover.isShown { popover.performClose(nil); return }
-        guard let button = item?.button else { return }
-        menuOpen = true
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
-        popover.contentViewController?.view.window?.makeFirstResponder(panel)
-        panelDismissal.start(panel: panel.window, status: button.window) { [weak self] in
-            guard let self, self.popover.isShown else { return }
-            self.popover.performClose(nil)
+    private func preparePanel() {
+        panelWindow.install(panel)
+        panel.onAdd = { [weak self] in self?.addProject() }
+        panel.onRefresh = { [weak self] in self?.refresh() }
+        panel.onMore = { [weak self] anchor in
+            guard let self else { return }
+            let options = NSMenu()
+            self.add("关于 DevBar…", action: #selector(self.showAbout), to: options)
+            options.addItem(.separator())
+            self.add("退出 DevBar", action: #selector(self.quit), to: options).keyEquivalent = "q"
+            options.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height), in: anchor)
         }
-        refresh()
+        panel.onClose = { [weak self] in self?.closePanel() }
+        panel.onResize = { [weak self] size in self?.panelWindow.resizeContent(size) }
+        panelWindow.onClose = { [weak self] in
+            self?.panelDismissal.stop()
+            self?.menuOpen = false
+        }
     }
 
-    func popoverDidClose(_ notification: Notification) {
-        panelDismissal.stop()
-        menuOpen = false
+    private func closePanel() {
+        menu.cancelTracking()
+        panelWindow.performClose(nil)
+    }
+
+    @objc private func togglePanel() {
+        if panelWindow.isVisible { closePanel(); return }
+        guard let button = item?.button else { return }
+        menuOpen = true
+        panelWindow.show(below: button)
+        panelDismissal.start(panel: panelWindow, status: button.window) { [weak self] in self?.closePanel() }
+        refresh()
     }
 
     @objc private func wake() { refresh() }
@@ -526,20 +636,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         DispatchQueue.global(qos: .utility).async {
             let result = Result { () -> ([Project], [SavedProject], ProjectPresentation, [String: ProjectIconAsset]) in
                 let known = try store.load()
-                var projects = try Discovery.scan(knownPaths: known.map(\.path))
-                let saved = try store.rememberDiscovered(projects)
+                var projects = try store.visible(Discovery.scan(knownPaths: known.map(\.path)))
+                let saved = known
                 let table = try ProcessTable.read()
                 let presentation = ProjectPresentation.read(saved: saved, store: store, table: table)
                 let runs = presentation.runs
                 for config in saved {
-                    if ProcessTable.active(runs[config.id], table: table), !projects.contains(where: { $0.path == config.path }), let run = runs[config.id] {
+                    if runs[config.id].map({ ProjectRunner.active($0, path: config.path, table: table) }) == true, !projects.contains(where: { $0.path == config.path }), let run = runs[config.id] {
                         projects.append(Project(path: config.path, name: config.name, listeners: [], processes: [
                             ProjectProcess(pid: run.pid, executable: "zsh", category: .project, label: "启动命令", canStop: true)
-                        ], entryPoints: [], auxiliaryServices: []))
+                        ], entryPoints: [], auxiliaryServices: [], freshness: RuntimeFreshness(state: run.targetID == nil ? .current : .starting, reason: "正在确认运行状态")))
                     }
                 }
-                for index in projects.indices { projects[index].freshness = RuntimeFreshnessInspector.inspect(projects[index], persist: true) }
-                let icons = iconLoader.load(paths: projects.map(\.path) + saved.map(\.path))
+                for index in projects.indices where saved.contains(where: { $0.path == projects[index].path }) {
+                    if let phase = RuntimeFreshnessInspector.inspect(projects[index], persist: true) { projects[index].freshness = phase }
+                }
+                let icons = iconLoader.load(paths: saved.map(\.path))
                 return (projects.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }, saved, presentation, icons)
             }
             DispatchQueue.main.async {
@@ -553,6 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 case .success(let state):
                     self.projects = state.0; self.saved = state.1; self.presentation = state.2; self.runs = state.2.runs
                     self.applyIcons(state.3)
+                    self.openReadyProjects()
                     self.error = nil
                     for config in self.saved {
                         if let run = self.runs[config.id], run.exitCode == nil,
@@ -564,10 +677,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                     self.launchDeadlines = self.launchDeadlines.filter { path, deadline in
                         deadline > Date() && self.projects.contains(where: { $0.path == path && !$0.hasReadyEndpoint })
                     }
-                case .failure(let error): self.error = error.localizedDescription
+                case .failure(let error): self.error = ProjectFeedback.message(error)
                 }
-                self.item?.button?.title = self.error == nil ? " \(self.projects.count)" : " !"
-                self.item?.button?.toolTip = "DevBar · \(self.projects.count) 个开发项目"
+                self.item?.button?.title = self.error == nil ? " \(self.projects.filter(\.isRunning).count)" : " !"
+                self.item?.button?.toolTip = "DevBar · \(self.projects.filter(\.isRunning).count) 个项目运行中"
                 self.rebuild()
                 if self.refreshRequested { self.refreshRequested = false; self.refresh() }
             }
@@ -591,65 +704,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private func updatePanel() {
         let running = Dictionary(uniqueKeysWithValues: projects.map { ($0.path, $0) })
         let configs = Dictionary(uniqueKeysWithValues: saved.map { ($0.path, $0) })
-        var models: [PanelProject] = []
-        for row in menu.items {
-            guard let path = row.representedObject as? String, let child = row.submenu else { continue }
+        let models: [PanelProject] = menu.items.compactMap { row in
+            guard let path = row.representedObject as? String, let child = row.submenu else { return nil }
             let project = running[path]
-            let config = configs[path]
-            let operation = operations[path]
-            let developmentFailure = project?.freshness?.state == .failed
-            let failed = developmentFailure || (config.flatMap { runs[$0.id]?.exitCode }.map { ![0, 130, 143].contains($0) } ?? false)
-            let detail: String
-            if let message = messages[path] { detail = message }
-            else if let operation { detail = operation }
-            else if developmentFailure { detail = "开发运行失败；修改后自动重试，详情见日志" }
-            else if let project {
-                if launchDeadlines[path].map({ $0 > Date() }) == true && !project.hasReadyEndpoint && project.desktop?.pid == nil && project.session == nil { detail = "启动中…" }
-                else if project.activityDetail == "本地进程", let config, let target = presentation.selected(config), [.ios, .android, .miniapp].contains(target.kind) {
-                    detail = target.kind == .miniapp ? "小程序编译监听" : "移动开发任务"
-                } else { detail = project.activityDetail }
-            } else { detail = failed ? "启动失败" : (config?.command.isEmpty == false ? config!.command : "设置启动") }
+            let detail = messages[path] ?? operations[path] ?? project?.activityDetail
+                ?? (configs[path].flatMap { runs[$0.id]?.exitCode }.map { [0, 130, 143].contains($0) ? "已停止" : "运行失败 · 可重试" } ?? "已停止")
             let options = NSMenu()
-            note(displayPath(path), to: options)
-            if let entry = child.items.first(where: { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) })?.copy() as? NSMenuItem {
-                options.addItem(.separator())
-                options.addItem(entry)
+            if let copied = child.copy() as? NSMenu {
+                for entry in copied.items { copied.removeItem(entry); options.addItem(entry) }
             }
-            if let management = child.items.first(where: { $0.title == "更多" })?.submenu?.copy() as? NSMenu {
-                options.addItem(.separator())
-                for entry in management.items { management.removeItem(entry); options.addItem(entry) }
-            }
-            if let log = child.items.first(where: { $0.action == #selector(showLog(_:)) })?.copy() as? NSMenuItem {
-                options.addItem(log)
-            }
-            if let message = messages[path] { note(message, to: options) }
-            let control = child.items.first { $0.identifier?.rawValue == "control" }
-            models.append(PanelProject(path: path, name: row.title, detail: detail, running: project != nil,
-                busy: operation != nil, failed: messages[path] != nil || failed, icon: projectImages[path] ?? fallbackIcon,
-                open: child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) }, control: control, more: options,
-                freshness: project?.freshness))
+            return PanelProject(path: path, name: row.title, detail: detail,
+                isRunning: project?.isRunning == true,
+                icon: projectImages[path] ?? fallbackIcon,
+                open: child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) },
+                control: child.items.first { $0.identifier?.rawValue == "control" }, more: options)
         }
-        let maxHeight = (item?.button?.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 700
-        panel.update(models, running: projects.count, error: error, scanning: scanning, maxHeight: min(680, maxHeight - 48))
-        popover.contentSize = panel.frame.size
+        panel.update(models, running: projects.filter(\.isRunning).count, error: error, scanning: scanning)
     }
 
     func renderPanel(_ projects: [Project], to path: String) throws {
+        preparePanel()
         _ = snapshot(projects)
-        let window = NSWindow(contentRect: panel.bounds, styleMask: .borderless, backing: .buffered, defer: false)
-        window.contentView = panel
-        window.appearance = NSAppearance(named: .darkAqua)
-        try panel.render(to: path)
-        window.orderOut(nil)
+        panelWindow.resizeContent(panel.frame.size)
+        panel.layoutSubtreeIfNeeded()
+        guard let bitmap = panel.bitmapImageRepForCachingDisplay(in: panel.bounds) else { throw failure("无法渲染面板") }
+        panel.cacheDisplay(in: panel.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else { throw failure("无法保存预览") }
+        try data.write(to: URL(fileURLWithPath: path))
     }
 
     @discardableResult
     private func note(_ text: String, to menu: NSMenu) -> NSMenuItem {
         let row = add(text, to: menu)
-        row.attributedTitle = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ])
         row.isEnabled = false
         return row
     }
@@ -665,6 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         row.representedObject = path
         row.image = projectImages[path] ?? fallbackIcon
         row.submenu = submenu
+        row.state = projects.contains { $0.path == path && $0.isRunning } ? .on : .off
         parent.addItem(row)
     }
 
@@ -678,29 +765,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             return order == .orderedSame ? left.0 < right.0 : order == .orderedAscending
         }
         if let error { note(error, to: root) }
-        if !projects.isEmpty {
-            note("运行中", to: root)
-            for project in projects.sorted(by: { precedes(($0.path, $0.name), ($1.path, $1.name)) }) {
-                let config = saved.first(where: { $0.path == project.path })
-                projectRow(name: config?.name ?? project.name, path: project.path, submenu: makeProjectMenu(project), to: root)
+        let running = Dictionary(uniqueKeysWithValues: projects.map { ($0.path, $0) })
+        let configs = Dictionary(uniqueKeysWithValues: saved.map { ($0.path, $0) })
+        let paths = Set(running.keys).union(configs.keys).sorted { left, right in
+            let a = running[left]?.isRunning == true, b = running[right]?.isRunning == true
+            if a != b { return a }
+            return precedes((left, configs[left]?.name ?? running[left]?.name ?? left),
+                            (right, configs[right]?.name ?? running[right]?.name ?? right))
+        }
+        for path in paths {
+            if let project = running[path] {
+                projectRow(name: configs[path]?.name ?? project.name, path: path, submenu: makeProjectMenu(project), to: root)
+            } else if let config = configs[path] {
+                projectRow(name: config.name, path: path, submenu: makeStoppedMenu(config), to: root)
             }
         }
-        let runningPaths = Set(projects.map(\.path))
-        let stopped = saved.filter { !runningPaths.contains($0.path) }.sorted { precedes(($0.path, $0.name), ($1.path, $1.name)) }
-        if !stopped.isEmpty {
-            if !root.items.isEmpty { root.addItem(.separator()) }
-            note("已停止", to: root)
-            for config in stopped {
-                projectRow(name: config.name, path: config.path, submenu: makeStoppedMenu(config), to: root)
-            }
-        }
-        if projects.isEmpty && stopped.isEmpty && error == nil { note(scanning ? "扫描中…" : "暂无项目", to: root) }
+        if paths.isEmpty && error == nil { note(scanning ? "扫描中…" : "暂无项目", to: root) }
         root.addItem(.separator())
         add("添加项目…", action: #selector(addProject), to: root).keyEquivalent = "n"
         let more = NSMenu()
         add("刷新", action: #selector(refresh), to: more).keyEquivalent = "r"
         add("关于 DevBar…", action: #selector(showAbout), to: more)
-        add("使用帮助", action: #selector(showHelp), to: more)
         add("退出 DevBar", action: #selector(quit), to: more).keyEquivalent = "q"
         addSubmenu("更多", child: more, to: root)
         return root
@@ -714,8 +799,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         else if failed { note("启动失败", to: child) }
         child.addItem(.separator())
         if let operation = operations[config.path] { note(operation, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
-        else if config.command.isEmpty { add("设置启动…", action: #selector(editProject(_:)), value: config.id, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
-        else { add("运行", action: #selector(startProject(_:)), value: config.id, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
+        else { add(failed ? "重试" : "运行", action: #selector(startProject(_:)), value: config.id, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
         let logInline = failed && presentation.logs.contains(config.id)
         if logInline { add("查看日志", action: #selector(showLog(_:)), value: config.id, to: child) }
         let more = makeMoreMenu(path: config.path, config: config, includeLog: !logInline)
@@ -755,21 +839,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         } else if let listener = project.entryPoints.first {
             add("打开网页", action: #selector(openURL(_:)), value: webpageURL(listener, config: config), to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
-        if project.desktop?.pid == nil, !project.hasReadyEndpoint, operations[project.path] == nil,
-           let run = config.flatMap({ runs[$0.id] }), Date().timeIntervalSince(run.startedAt) < 30 {
+        let managed = !(presentation.activeTargets[project.path] ?? []).isEmpty
+        if project.freshness?.state == .starting, !project.isRunning, operations[project.path] == nil {
             note("启动中…", to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
         if let operation = operations[project.path] {
             note(operation, to: child).identifier = NSUserInterfaceItemIdentifier("control")
-        } else if let config, let run = runs[config.id], run.targetID != nil {
-            let selected = presentation.selectedTargets[config.path] ?? run.targetID!
-            let active = presentation.activeTargets[config.path]?.contains(selected) == true
-            let row = add(active ? "停止当前目标" : "运行当前目标", action: active ? #selector(stopProject(_:)) : #selector(startProject(_:)), value: active ? project.path + "\n" + selected : config.id, to: child)
+        } else if managed, let config, let run = runs[config.id] {
+            let count = presentation.activeTargets[config.path]?.count ?? 0
+            let failed = run.targetID.flatMap { presentation.targetPhases[config.path]?[$0] } == .failed || project.freshness?.state == .failed
+            let retry = failed && !project.isRunning && count == 1 && (run.targetID == nil || run.targetID == presentation.selectedTargets[config.path])
+            let value = project.path
+            let row = add(retry ? "重试" : "停止", action: retry ? #selector(restartProject(_:)) : #selector(stopProject(_:)),
+                          value: retry ? config.id : value, to: child)
             row.identifier = NSUserInterfaceItemIdentifier("control")
-        } else if project.processes.contains(where: \.canStop) {
-            let row = add("停止项目进程", action: #selector(stopProject(_:)), value: project.path, to: child)
-            row.toolTip = "停止此项目中识别到的可停止进程"
+        } else {
+            let row = add("停止", action: #selector(stopProject(_:)), value: project.path, to: child)
             row.identifier = NSUserInterfaceItemIdentifier("control")
+            row.isEnabled = !project.controlProcesses.isEmpty
+            if !row.isEnabled { row.toolTip = "暂时无法确认运行进程，请刷新后重试" }
         }
         child.addItem(.separator())
         let more = NSMenu()
@@ -785,6 +873,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             add(title, action: #selector(copyURL(_:)), value: listener.url, to: more)
         }
         if !project.entryPoints.isEmpty { more.addItem(.separator()) }
+        if managed, project.freshness?.state == .failed || presentation.targetPhases[project.path]?.values.contains(.failed) == true {
+            add("停止", action: #selector(stopProject(_:)), value: project.path, to: more)
+        }
         let management = makeMoreMenu(path: project.path, config: config)
         for row in management.items { management.removeItem(row); more.addItem(row) }
         addSubmenu("更多", child: more, to: child)
@@ -794,21 +885,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private func makeMoreMenu(path: String, config: SavedProject?, includeLog: Bool = true) -> NSMenu {
         let more = NSMenu()
         if let config {
-            if !config.command.isEmpty {
-                add("重启开发", action: #selector(restartProject(_:)), value: config.id, to: more)
+            if projects.contains(where: { $0.path == path }), operations[path] == nil {
+                add("重启", action: #selector(restartProject(_:)), value: config.id, to: more)
             }
             let targets = presentation.profiles[path]?.targets ?? []
-            if targets.count > 1 {
+            if targets.count > 1 || config.targetID.map({ id in !targets.contains { $0.id == id } }) == true
+                || !config.command.isEmpty && !targets.isEmpty && presentation.selected(config) == nil {
                 let choices = NSMenu()
                 for target in targets {
                     let active = presentation.activeTargets[path]?.contains(target.id) == true
-                    let row = add(target.title + (active ? " · 运行中" : " · 已停止"), action: #selector(toggleTarget(_:)), value: config.id + "\n" + target.id, to: choices)
+                    let phase = presentation.targetPhases[path]?[target.id]
+                    let status = phase == .failed ? "运行失败" : (phase == .starting ? "启动中" : (active ? "运行中" : "已停止"))
+                    let chooseOnly = projects.contains(where: { $0.path == path }) && (presentation.activeTargets[path] ?? []).isEmpty
+                    let row = add(chooseOnly ? target.title : target.title + " · " + status,
+                        action: chooseOnly ? #selector(selectTarget(_:)) : #selector(toggleTarget(_:)), value: config.id + "\n" + target.id, to: choices)
+                    if chooseOnly { row.state = config.targetID == target.id || config.command == target.command ? .on : .off }
                     row.isEnabled = operations[path] == nil
-                    row.toolTip = target.environmentIssue ?? target.note
+                    row.toolTip = target.environmentIssue.map { ProjectFeedback.message($0) }
                 }
-                addSubmenu("运行目标", child: choices, to: more)
+                addSubmenu("运行方式", child: choices, to: more)
                 more.addItem(.separator())
             }
+        }
+
+        if config == nil, projects.contains(where: { $0.path == path }) {
+            add("重启", action: #selector(restartObservedProject(_:)), value: path, to: more).isEnabled = operations[path] == nil
+            add("设置…", action: #selector(editObservedProject(_:)), value: path, to: more).isEnabled = operations[path] == nil
         }
 
         if let config, let target = presentation.selected(config) {
@@ -826,7 +928,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             }
             if operations[path] == nil {
                 more.addItem(.separator())
-                add("移除", action: #selector(removeProject(_:)), value: config.id, to: more)
+                let remove = add("移除", action: #selector(removeProject(_:)), value: config.id, to: more)
+                remove.isEnabled = (presentation.activeTargets[path] ?? []).isEmpty
+                if !remove.isEnabled { remove.toolTip = "请先停止项目" }
             }
         }
         return more
@@ -882,13 +986,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         current.update()
     }
 
+    func verifyNativeMenu() {
+        let first = SavedProject(name: "Web project", path: "/fixture/web", command: "npm run dev")
+        let second = SavedProject(name: "API service", path: "/fixture/api", command: "python app.py")
+        saved = [first, second]
+        projects = []
+        rebuild()
+        func assertSystemItems(_ current: NSMenu) {
+            for row in current.items {
+                precondition(row.view == nil && row.attributedTitle == nil,
+                             "Production menus must use system-rendered items without custom views or styling")
+                if let child = row.submenu { assertSystemItems(child) }
+            }
+        }
+        assertSystemItems(menu)
+        precondition(menu.items.filter { $0.representedObject is String && $0.submenu != nil }.count == 2)
+        assertSystemItems(menu)
+        let listener = Listener(pid: 101, port: 5173, process: "node")
+        let run = RunRecord(token: "auto-open", pid: 101, signature: "fixture", startedAt: Date(), exitCode: nil, targetID: "dev")
+        runs[first.id] = run
+        presentation.activeTargets[first.path] = ["dev"]
+        projects = [Project(path: first.path, name: first.name, listeners: [], processes: [], entryPoints: [], auxiliaryServices: [])]
+        pendingOpens[first.path] = PendingOpen(token: run.token, kind: .web, deadline: Date().addingTimeInterval(180))
+        precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] != nil,
+                     "Wait for a verified webpage entry")
+        projects[0] = Project(path: first.path, name: first.name, listeners: [listener], processes: [], entryPoints: [listener], auxiliaryServices: [])
+        let automatic = takeReadyOpen(path: first.path)
+        precondition(automatic?.action == #selector(openURL(_:)) && automatic?.representedObject as? String == listener.url)
+        precondition(takeReadyOpen(path: first.path) == nil, "Auto-open once per launch")
+        pendingOpens[first.path] = PendingOpen(token: run.token, kind: .desktop, deadline: Date().addingTimeInterval(180))
+        precondition(takeReadyOpen(path: first.path) == nil, "Desktop launches must not open their development server")
+        pendingOpens[first.path] = PendingOpen(token: "previous-launch", kind: .web, deadline: Date().addingTimeInterval(180))
+        precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] == nil, "Ignore superseded launches")
+        pendingOpens[first.path] = PendingOpen(token: run.token, kind: .web, deadline: .distantPast)
+        precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] == nil, "Expire delayed launches")
+        pendingOpens[first.path] = PendingOpen(token: run.token, kind: .web, deadline: .distantFuture)
+        presentation.targetPhases[first.path] = ["dev": .failed]
+        precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] == nil, "Do not open failed launches")
+        print("PASS: automatic opening waits for readiness, opens once, ignores failed/expired/superseded starts and desktop dev servers; no windows opened")
+        print("PASS: standard NSMenu action routing without custom menu views or attributed styling; project submenus retained")
+    }
+
     func verifyMenuRefresh() {
         let path = "/devbar/menu-refresh-fixture"
         let config = SavedProject(name: "Fixture", path: path, command: "npm run dev")
         let process = ProjectProcess(pid: 101, executable: "node", category: .project, label: "Vite", canStop: true)
-        let initial = Project(path: path, name: "Fixture", listeners: [], processes: [process], entryPoints: [], auxiliaryServices: [])
+        var initial = Project(path: path, name: "Fixture", listeners: [], processes: [process], entryPoints: [], auxiliaryServices: [])
+        initial.freshness = RuntimeFreshness(state: .starting, reason: "启动中")
         saved = [config]
-        runs = [config.id: RunRecord(token: "fixture", pid: 101, signature: "test", startedAt: Date(), exitCode: nil)]
+        runs = [config.id: RunRecord(token: "fixture", pid: 101, signature: "test", startedAt: Date(), exitCode: nil, targetID: "dev")]
+        presentation.activeTargets[path] = ["dev"]
+        presentation.selectedTargets[path] = "dev"
         projects = [initial]
         rebuild()
         let child = menu.items.first(where: { $0.representedObject as? String == path })!.submenu!
@@ -919,7 +1067,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         projects = [inactiveDesktop]
         rebuild()
         precondition(placeholder.isEnabled && placeholder.action == #selector(openURL(_:)))
-        precondition(stop.title == "停止项目进程" && stop.toolTip?.contains("可停止进程") == true)
+        precondition(stop.title == "停止")
         inactiveDesktop.desktop?.pid = 101
         precondition(inactiveDesktop.activityDetail == "桌面应用")
         projects = [inactiveDesktop]
@@ -943,6 +1091,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         precondition(pollInterval == 3)
         launchDeadlines[path] = Date().addingTimeInterval(10)
         precondition(pollInterval == 1)
+        projects = [inactiveDesktop]
+        presentation.activeTargets[path] = []
+        rebuild()
+        precondition(child.items.contains { $0.title == "停止" && $0.action == #selector(stopProject(_:)) })
+        precondition(!child.items.contains { $0.title.contains("其他应用") || $0.title.contains("启动它") })
         print("PASS: live startup/port/stop/run transitions preserve menu items, disable duplicate actions and use adaptive polling")
     }
 
@@ -955,6 +1108,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             return Project(path: config.path, name: config.name, listeners: [], processes: [
                 ProjectProcess(pid: run.pid, executable: "zsh", category: .project, label: "开发会话", canStop: true)
             ], entryPoints: [], auxiliaryServices: [])
+        }
+        if let path, var current = try? Discovery.scan(knownPaths: [path], light: true, onlyPaths: [path]).first(where: { $0.path == path }) {
+            current.freshness = RuntimeFreshnessInspector.inspect(current, persist: false)
+            projects.removeAll { $0.path == path }
+            projects.append(current)
         }
         var longest = 0.0
         for _ in 0..<8 {
@@ -996,7 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     private func report(_ error: Error) {
         let alert = NSAlert()
-        alert.messageText = error.localizedDescription
+        alert.messageText = ProjectFeedback.message(error)
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -1013,13 +1171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     @objc private func addProject() {
-        popover.performClose(nil)
+        closePanel()
         if let config = ProjectEditor.add() { saveEditor(config) }
     }
 
     @objc private func editProject(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let config = saved.first(where: { $0.id == id }), operations[config.path] == nil else { return }
-        popover.performClose(nil)
+        closePanel()
         if let edited = ProjectEditor.edit(config) { saveEditor(edited) }
     }
 
@@ -1038,44 +1196,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         guard operations[path] == nil else { return }
         let store = self.store
         operations[path] = message
+        pendingOpens[path] = nil
         configRevision += 1
         messages[path] = nil
         rebuild()
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { () -> [RunRecord] in
-                try work()
-                guard let config = try store.load().first(where: { $0.path == path }) else { return [] }
+            let result = Result { () -> ([RunRecord], [SavedProject], ProjectPresentation) in
+                do { try work() }
+                catch { store.logIssue(path: path, error: error); throw error }
+                let configs = try store.load()
                 let table = try ProcessTable.read()
-                return store.runs(config.id).filter { ProcessTable.active($0, table: table) }
+                let state = ProjectPresentation.read(saved: configs, store: store, table: table)
+                let active = configs.first(where: { $0.path == path }).map { config in
+                    store.runs(config.id).filter { ProjectRunner.active($0, path: path, table: table) }
+                } ?? []
+                return (active, configs, state)
             }
             DispatchQueue.main.async {
                 self.operations[path] = nil
                 self.configRevision += 1
-                var showRunning = false
-                if message == "启动中…", case .success(let activeRuns) = result,
+                if case .success(let (_, configs, state)) = result {
+                    self.saved = configs; self.presentation = state; self.runs = state.runs
+                }
+                if message == "启动中…", case .success(let (activeRuns, _, state)) = result,
                    let config = self.saved.first(where: { $0.path == path }),
                    let run = activeRuns.max(by: { $0.startedAt < $1.startedAt }) {
                     self.launchDeadlines[path] = Date().addingTimeInterval(30)
+                    self.pendingOpens[path] = PendingOpen(token: run.token, kind: state.selected(config)?.kind,
+                        deadline: Date().addingTimeInterval(180))
                     self.presentation.activity[path] = Date()
                     self.runs[config.id] = run
                     self.presentation.activeTargets[path] = Set(activeRuns.compactMap(\.targetID))
                     self.presentation.selectedTargets[path] = run.targetID
                     self.presentation.logs.insert(config.id)
-                    if !self.projects.contains(where: { $0.path == path }) {
+                    let phase = run.targetID.flatMap { state.targetPhases[path]?[$0] }
+                    let freshness = RuntimeFreshness(state: phase == .failed ? .failed : .starting, reason: "正在确认运行状态")
+                    if let index = self.projects.firstIndex(where: { $0.path == path }) {
+                        if !self.projects[index].isRunning { self.projects[index].freshness = freshness }
+                    } else {
                         self.projects.append(Project(path: path, name: config.name, listeners: [], processes: [
                             ProjectProcess(pid: run.pid, executable: "zsh", category: .project, label: "启动命令", canStop: true)
-                        ], entryPoints: [], auxiliaryServices: []))
+                        ], entryPoints: [], auxiliaryServices: [], freshness: freshness))
                     }
-                    showRunning = true
                 } else { self.launchDeadlines[path] = nil }
                 if case .failure(let error) = result {
-                    self.messages[path] = error.localizedDescription
+                    self.messages[path] = error.localizedDescription.contains("已经运行") ? nil : ProjectFeedback.message(error)
+                    if let config = self.saved.first(where: { $0.path == path }) { self.presentation.logs.insert(config.id) }
                     if reportFailure { self.report(error) }
                 }
                 self.rebuild()
-                if showRunning { self.panel.showRunning() }
                 self.refresh()
             }
+        }
+    }
+
+    // Consume only requests created by an explicit Start/Restart in this app.
+    // Routine scans and previously running projects must never reopen windows.
+    private func takeReadyOpen(path: String, now: Date = Date()) -> NSMenuItem? {
+        guard let request = pendingOpens[path] else { return nil }
+        guard request.deadline > now,
+              let config = saved.first(where: { $0.path == path }),
+              let run = runs[config.id], run.token == request.token, run.exitCode == nil,
+              let target = run.targetID,
+              presentation.activeTargets[path]?.contains(target) == true,
+              presentation.targetPhases[path]?[target] != .failed else {
+            pendingOpens[path] = nil
+            return nil
+        }
+        guard operations[path] == nil, let project = projects.first(where: { $0.path == path }),
+              project.freshness?.state != .failed else { return nil }
+        switch request.kind {
+        case .desktop:
+            guard project.desktop?.pid != nil || project.session?.kind == .desktop else { return nil }
+        case .ios, .browserExtension:
+            guard project.session?.kind == request.kind else { return nil }
+        case .web, .staticWeb:
+            guard let listener = project.entryPoints.first else { return nil }
+            pendingOpens[path] = nil
+            let entry = NSMenuItem(title: "打开网页", action: #selector(openURL(_:)), keyEquivalent: "")
+            entry.representedObject = webpageURL(listener, config: config)
+            return entry
+        case .service, .script, .tool:
+            pendingOpens[path] = nil
+            return nil
+        default: break
+        }
+        let menu = makeProjectMenu(project)
+        guard let entry = menu.items.first(where: { $0.identifier?.rawValue == "entry-0" }),
+              let action = entry.submenu?.items.first(where: { $0.action != nil && $0.isEnabled }) ?? (entry.action != nil ? entry : nil),
+              action.isEnabled else { return nil }
+        // Remove before dispatch so subsequent refreshes cannot open twice.
+        pendingOpens[path] = nil
+        return action
+    }
+
+    private func openReadyProjects() {
+        for path in Array(pendingOpens.keys) {
+            guard let entry = takeReadyOpen(path: path), let action = entry.action else { continue }
+            NSApp.sendAction(action, to: self, from: entry)
         }
     }
 
@@ -1098,7 +1316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
               let target = presentation.profiles[config.path]?.targets.first(where: { $0.id == parts[1] }) else { return }
         config.targetID = target.id
         config.command = target.command
-        do { try store.save(config); noteActivity(config.path); configRevision += 1; saved = try store.load(); rebuild() }
+        do { try store.save(config); messages[config.path] = nil; noteActivity(config.path); configRevision += 1; saved = try store.load(); rebuild() }
         catch { report(error) }
     }
     @objc private func toggleTarget(_ sender: NSMenuItem) {
@@ -1106,13 +1324,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let parts = value.components(separatedBy: "\n")
         guard parts.count == 2, var config = saved.first(where: { $0.id == parts[0] }),
               let target = presentation.profiles[config.path]?.targets.first(where: { $0.id == parts[1] }) else { return }
-        if presentation.activeTargets[config.path]?.contains(target.id) == true {
+        if presentation.activeTargets[config.path]?.contains(target.id) == true, presentation.targetPhases[config.path]?[target.id] != .failed {
             let legacy = runs[config.id]?.targetID == nil
             let item = NSMenuItem(); item.representedObject = legacy ? config.path : config.path + "\n" + target.id; stopProject(item)
         } else {
             config.targetID = target.id; config.command = target.command
             let store = self.store
-            perform(path: config.path, message: "启动中…") { try ProjectRunner.start(config, store: store) }
+            perform(path: config.path, message: "启动中…") {
+                try store.save(config)
+                try ProjectRunner.start(config, store: store)
+            }
         }
     }
     @objc private func openTargetSession(_ sender: NSMenuItem) {
@@ -1122,7 +1343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         TargetRuntime.openSession(session) { [weak self] error in
             guard let self else { return }
             self.operations[path] = nil
-            if let error { self.messages[path] = error.localizedDescription } else { self.noteActivity(path); self.popover.performClose(nil) }
+            if let error { self.messages[path] = ProjectFeedback.message(error) } else { self.noteActivity(path); self.closePanel() }
             self.rebuild()
         }
     }
@@ -1136,7 +1357,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     @objc private func restartProject(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let config = saved.first(where: { $0.id == id }) else { return }
         let store = self.store
-        perform(path: config.path, message: "启动中…") { try ProjectRunner.restart(config, store: store) }
+        let observed = projects.first { $0.path == config.path }
+        perform(path: config.path, message: "启动中…") { try ProjectRunner.restartProject(config, store: store, observed: observed) }
+    }
+
+    @objc private func restartObservedProject(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String, let observed = projects.first(where: { $0.path == path }) else { return }
+        let store = self.store
+        perform(path: path, message: "启动中…") {
+            let existing = try store.load().first { $0.path == path }
+            let config = existing ?? SavedProject(name: observed.name, path: path, command: "")
+            if existing == nil { try store.save(config) }
+            try ProjectRunner.restartProject(config, store: store, observed: observed)
+        }
+    }
+
+    @objc private func editObservedProject(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String, operations[path] == nil else { return }
+        closePanel()
+        if let config = ProjectEditor.edit(path: path) { saveEditor(config) }
     }
 
     @objc private func stopProject(_ sender: NSMenuItem) {
@@ -1146,27 +1385,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let targetID = parts.count == 2 ? parts[1] : nil
         guard operations[path] == nil else { return }
         let store = self.store
+        let observed = projects.first { $0.path == path }
         // Paint feedback before signalling the recorded process on a worker.
         operations[path] = "停止中…"
+        pendingOpens[path] = nil
         configRevision += 1
         messages[path] = nil
         rebuild()
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { () -> (ProjectRunner.StopOutcome, [RunRecord]) in
-                let outcome = try ProjectRunner.stop(path: path, store: store, targetID: targetID).outcome
+            let result = Result { () -> (ProjectRunner.StopOutcome, [RunRecord], [SavedProject]) in
+                do {
+                if let observed, try store.load().first(where: { $0.path == path }) == nil {
+                    try? store.save(SavedProject(name: observed.name, path: path, command: ""))
+                }
                 let config = try store.load().first { $0.path == path }
+                let before = try ProcessTable.read()
+                let owned = config.map { store.runs($0.id).filter { ProjectRunner.active($0, path: path, table: before) } } ?? []
+                let targets: [String?] = targetID.map { [$0] } ?? (owned.isEmpty ? (observed == nil ? [nil] : []) : Array(Set(owned.map(\.targetID))))
+                var forced = false, waiting = false, residual = Set<Int>()
+                for target in targets {
+                    switch try ProjectRunner.stop(path: path, store: store, targetID: target).outcome {
+                    case .stopped: break
+                    case .forceStopped(let remaining): forced = true; residual.formUnion(remaining)
+                    case .stillRunning: waiting = true
+                    }
+                }
+                if targetID == nil, let observed, !waiting {
+                    guard !observed.controlProcesses.isEmpty || !owned.isEmpty else { throw failure("暂时无法确认运行进程，请刷新后重试") }
+                    if case .stillRunning = try ProjectRunner.stopObserved(observed) { waiting = true }
+                }
                 let table = try ProcessTable.read()
-                let active = config.map { store.runs($0.id).filter { ProcessTable.active($0, table: table) } } ?? []
-                return (outcome, active)
+                let active = config.map { store.runs($0.id).filter { ProjectRunner.active($0, path: path, table: table) } } ?? []
+                let outcome: ProjectRunner.StopOutcome = waiting ? .stillRunning : (forced ? .forceStopped(residual: residual.sorted()) : .stopped)
+                return (outcome, active, try store.load())
+                } catch { store.logIssue(path: path, error: error); throw error }
             }
             DispatchQueue.main.async {
                 self.operations[path] = nil
                 self.configRevision += 1
                 self.launchDeadlines[path] = nil
                 switch result {
-                case .success(let (outcome, active)):
+                case .success(let (outcome, active, configs)):
+                    self.saved = configs
                     self.presentation.activity[path] = Date()
                     self.presentation.activeTargets[path] = Set(active.compactMap(\.targetID))
+                    self.presentation.targetPhases[path] = self.presentation.targetPhases[path]?.filter { key, _ in active.contains { $0.targetID == key } }
                     if let config = self.saved.first(where: { $0.path == path }) {
                         self.runs[config.id] = active.first
                     }
@@ -1177,12 +1440,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                         if active.isEmpty { self.projects.removeAll { $0.path == path } }
                     case .forceStopped(let residual):
                         if active.isEmpty && residual.isEmpty { self.projects.removeAll { $0.path == path } }
-                        if !residual.isEmpty { self.messages[path] = "已停止；\(residual.count) 个后台进程仍在退出" }
+                        if !residual.isEmpty { self.messages[path] = "正在完成停止，请稍后刷新" }
                     case .stillRunning:
-                        self.messages[path] = "已请求停止，部分进程尚未退出；未强制结束"
+                        self.messages[path] = "尚未停止，请保存当前工作后重试"
                     }
                 case .failure(let error):
-                    self.messages[path] = error.localizedDescription
+                    self.messages[path] = ProjectFeedback.message(error)
+                    if let config = self.saved.first(where: { $0.path == path }) { self.presentation.logs.insert(config.id) }
                 }
                 self.rebuild()
                 self.refresh()
@@ -1198,12 +1462,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
     @objc private func openDesktop(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String, operations[path] == nil else { return }
-        popover.performClose(nil)
+        closePanel()
         operations[path] = "打开中…"
         messages[path] = nil
         rebuild()
         DispatchQueue.global(qos: .userInitiated).async {
-            let discovered = try? Discovery.scan(knownPaths: [path]).first { $0.path == path }
+            let discovered = try? Discovery.scan(knownPaths: [path], onlyPaths: [path]).first { $0.path == path }
             let target = discovered?.desktop ?? DesktopApplications.resolve(path: path, processes: [], commands: [:],
                 directories: [:], candidates: DesktopApplications.candidates())
             DispatchQueue.main.async {
@@ -1215,7 +1479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
                 }
                 DesktopApplications.open(target) { error in
                     self.operations[path] = nil
-                    if let error { self.messages[path] = error.localizedDescription } else { self.noteActivity(path) }
+                    if let error { self.messages[path] = ProjectFeedback.message(error) } else { self.noteActivity(path) }
                     self.rebuild()
                     self.refresh()
                 }
@@ -1224,11 +1488,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     @objc private func openURL(_ sender: NSMenuItem) {
-        guard let value = sender.representedObject as? String, let url = URL(string: value) else { return }
-        if NSWorkspace.shared.open(url), let project = projects.first(where: { project in
-            let config = saved.first(where: { $0.path == project.path })
-            return project.entryPoints.contains { webpageURL($0, config: config) == value || $0.url == value }
-        }) { noteActivity(project.path); rebuild() }
+        guard let value = sender.representedObject as? String, let url = URL(string: value),
+              let project = projects.first(where: { $0.entryPoints.contains { $0.port == url.port && $0.scheme == url.scheme } }),
+              let listener = project.entryPoints.first(where: { $0.port == url.port && $0.scheme == url.scheme }), operations[project.path] == nil else { return }
+        guard let identity = project.processes.first(where: { $0.pid == listener.pid })?.identity
+            ?? project.controlProcesses.first(where: { $0.pid == listener.pid }) else {
+            messages[project.path] = "请刷新项目状态后重试"; rebuild(); refresh(); return
+        }
+        var observation = project
+        observation.controlProcesses = [identity]
+        operations[project.path] = "打开中…"
+        messages[project.path] = nil
+        rebuild()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let current = (try? ProcessTable.read(identity.pid)) ?? [:]
+            let valid = !ProjectRunner.verifiedControls(observation, table: current).isEmpty
+            DispatchQueue.main.async {
+                self.operations[project.path] = nil
+                if valid, NSWorkspace.shared.open(url) {
+                    self.noteActivity(project.path)
+                    self.closePanel()
+                } else { self.messages[project.path] = "运行入口已改变，请刷新后重试" }
+                self.rebuild()
+                self.refresh()
+            }
+        }
     }
     @objc private func copyURL(_ sender: NSMenuItem) {
         guard let value = sender.representedObject as? String else { return }
@@ -1243,12 +1527,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     @objc private func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "DevBar"])
-    }
-    @objc private func showHelp() {
-        guard let file = Bundle.main.url(forResource: "README", withExtension: "md") else {
-            report(failure("此构建缺少帮助文档，请使用完整的 DevBar.app")); return
-        }
-        NSWorkspace.shared.open(file)
     }
     @objc private func quit() { NSApp.terminate(nil) }
 }
@@ -1274,6 +1552,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
 
 } else if let path = cliValue("--develop-project"), let command = cliValue("--development-command") {
     do { try DevelopmentRuntime.run(path: path, command: command) }
+    catch let error as DevelopmentRuntime.CommandExit { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(Int32(error.code)) }
     catch { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(1) }
 } else if ["sync", "status", "doctor", "inventory", "init", "stop"].contains(cliArguments.dropFirst().first ?? "") || cliArguments.contains("--sync-project") || cliArguments.contains("--sync-status") {
     let action = cliArguments.contains("--sync-status") ? "status" : cliArguments.contains("--sync-project") ? "sync" : cliArguments[1]
@@ -1346,7 +1625,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
     } catch { fputs("DevBar: \(error.localizedDescription)\n", stderr); exit(1) }
 } else if let path = cliValue("--desktop-project") ?? cliValue("--open-desktop-project") {
     do {
-        let project = try Discovery.scan(knownPaths: [path]).first { $0.path == path }
+        let project = try Discovery.scan(knownPaths: [path], onlyPaths: [path]).first { $0.path == path }
         let target = project?.desktop ?? DesktopApplications.resolve(path: path, processes: [], commands: [:], directories: [:], candidates: DesktopApplications.candidates())
         if cliValue("--open-desktop-project") != nil {
             guard let target else { throw failure("未找到桌面应用") }
@@ -1409,12 +1688,15 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
         } else {
             let id = cliValue("--start-project") ?? cliValue("--restart-project") ?? cliValue("--stop-project") ?? cliValue("--remove-project") ?? ""
             guard var config = try store.load().first(where: { $0.id == id }) else { throw failure("项目不存在") }
-            if let targetID = cliValue("--target") {
+            if let targetID = cliValue("--target"), cliArguments.contains("--start-project") || cliArguments.contains("--restart-project") {
                 guard let target = ProjectProfiles.profile(config.path).targets.first(where: { $0.id == targetID }) else { throw failure("运行目标不存在") }
                 config.targetID = target.id; config.command = target.command
             }
             if cliArguments.contains("--start-project") || cliArguments.contains("--restart-project") {
-                if cliArguments.contains("--restart-project") { try ProjectRunner.restart(config, store: store) }
+                if cliArguments.contains("--restart-project"), cliValue("--target") == nil {
+                    let observed = try Discovery.scan(knownPaths: [config.path], light: true, onlyPaths: [config.path]).first { $0.path == config.path }
+                    try ProjectRunner.restartProject(config, store: store, observed: observed)
+                } else if cliArguments.contains("--restart-project") { try ProjectRunner.restart(config, store: store) }
                 else { try ProjectRunner.start(config, store: store) }
                 print("Started")
                 fflush(stdout)
@@ -1424,7 +1706,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
                 }
             } else if cliArguments.contains("--stop-project") {
                 let outcome = try ProjectRunner.stop(path: config.path, store: store, targetID: cliValue("--target")).outcome
-                if case .stillRunning = outcome { throw failure("已请求停止，部分进程尚未退出；未强制结束") }
+                if case .stillRunning = outcome { throw failure("尚未停止，请保存当前工作后重试") }
                 print("Stopped")
             } else {
                 try store.remove(id)
@@ -1437,17 +1719,19 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let saved = try ProjectStore().load()
-        var projects = try Discovery.scan(knownPaths: saved.map(\.path))
         let store = ProjectStore()
+        var projects = try store.visible(Discovery.scan(knownPaths: saved.map(\.path)))
         let table = try ProcessTable.read()
         for config in saved {
-            if let run = store.runs(config.id).first(where: { ProcessTable.active($0, table: table) }), !projects.contains(where: { $0.path == config.path }) {
+            if let run = store.runs(config.id).first(where: { ProjectRunner.active($0, path: config.path, table: table) }), !projects.contains(where: { $0.path == config.path }) {
                 projects.append(Project(path: config.path, name: config.name, listeners: [], processes: [
                     ProjectProcess(pid: run.pid, executable: "zsh", category: .project, label: "启动命令", canStop: true)
-                ], entryPoints: [], auxiliaryServices: []))
+                ], entryPoints: [], auxiliaryServices: [], freshness: RuntimeFreshness(state: run.targetID == nil ? .current : .starting, reason: "正在确认运行状态")))
             }
         }
-        for index in projects.indices { projects[index].freshness = RuntimeFreshnessInspector.inspect(projects[index], persist: false) }
+        for index in projects.indices where saved.contains(where: { $0.path == projects[index].path }) {
+            if let phase = RuntimeFreshnessInspector.inspect(projects[index], persist: false) { projects[index].freshness = phase }
+        }
         if let output = cliValue("--render-panel") {
             try MainActor.assumeIsolated {
                 NSApplication.shared.setActivationPolicy(.prohibited)
@@ -1473,15 +1757,13 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
     }
 } else if CommandLine.arguments.contains("--self-test-freshness") {
     RuntimeFreshnessInspector.verify()
-} else if CommandLine.arguments.contains("--self-test-dismissal") {
+} else if CommandLine.arguments.contains("--self-test-native-menu")
+    || CommandLine.arguments.contains("--self-test-panel")
+    || CommandLine.arguments.contains("--self-test-dismissal") {
     MainActor.assumeIsolated {
         NSApplication.shared.setActivationPolicy(.prohibited)
-        PanelDismissalMonitor.verify()
-    }
-} else if CommandLine.arguments.contains("--self-test-panel") {
-    try MainActor.assumeIsolated {
-        NSApplication.shared.setActivationPolicy(.prohibited)
-        try ProjectPanelView.verify(output: cliValue("--preview"))
+        AppDelegate().verifyNativeMenu()
+        ProjectPanelView.verify(output: cliValue("--preview"))
     }
 } else if CommandLine.arguments.contains("--self-test-interaction-latency") {
     let store = ProjectStore()
@@ -1502,6 +1784,7 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
     }
 } else if CommandLine.arguments.contains("--self-test") {
     EntryPointSelector.verify()
+    ProjectRunner.verifyObservedControls()
     let embedded = "workerd serve --socket-addr=entry=127.0.0.1:0 --control-fd=3"
     precondition(Discovery.orphanedEmbeddedRuntime(executable: "/project/node_modules/workerd", command: embedded, parent: 1))
     precondition(!Discovery.orphanedEmbeddedRuntime(executable: "workerd", command: embedded, parent: 42))
@@ -1512,6 +1795,37 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
     precondition(Discovery.parseListeners("p0\nn*:bad\n").isEmpty)
     precondition(Discovery.parseDirectories("p101\nfcwd\nn/a path/project\n")[101] == "/a path/project")
     precondition(Discovery.projectRoot("/Applications/Example.app/Contents") == nil)
+    for folder in ["Documents", "Desktop", "Downloads", "Library/Mobile Documents", "Library/CloudStorage"] {
+        precondition(Discovery.projectRoot(NSHomeDirectory() + "/" + folder + "/unselected-project") == nil)
+    }
+    // A bundle outside /Applications is still an artifact. Bundled manifests
+    // must not create Contents/Resources projects; source ancestors remain valid.
+    let detectionFixture = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("DevBarBundleDetection-" + UUID().uuidString)
+    do {
+        defer { try? FileManager.default.removeItem(at: detectionFixture) }
+        let fm = FileManager.default
+        let contents = detectionFixture.appendingPathComponent("Applications/QuiX Dev.app/Contents")
+        try fm.createDirectory(at: contents.appendingPathComponent("Resources/app"), withIntermediateDirectories: true)
+        try Data("<plist><dict/></plist>".utf8).write(to: contents.appendingPathComponent("Info.plist"))
+        try Data("{}".utf8).write(to: contents.appendingPathComponent("Resources/app/package.json"))
+        precondition(Discovery.projectRoot(contents.path) == nil)
+        precondition(Discovery.projectRoot(contents.appendingPathComponent("Resources/app").path) == nil)
+        let alias = detectionFixture.appendingPathComponent("Alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: contents)
+        precondition(Discovery.projectRoot(alias.path) == nil)
+        precondition(ProjectProfiles.isApplicationBundlePath(alias.path))
+        let source = detectionFixture.appendingPathComponent("Source")
+        let built = source.appendingPathComponent("out/Example.APP/Contents")
+        try fm.createDirectory(at: built, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: source.appendingPathComponent("package.json"))
+        try Data("<plist><dict/></plist>".utf8).write(to: built.appendingPathComponent("Info.plist"))
+        precondition(Discovery.projectRoot(built.path) == source.path)
+        let normalContents = source.appendingPathComponent("Contents")
+        try fm.createDirectory(at: normalContents, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: normalContents.appendingPathComponent("package.json"))
+        precondition(Discovery.projectRoot(normalContents.path) == normalContents.path)
+    } catch { fatalError("Bundle detection fixture failed: \(error)") }
     precondition(Discovery.projectRoot(NSHomeDirectory() + "/Library/Application Support/tool") == nil)
     precondition(Discovery.projectRoot("node") == nil, "Relative process titles must not resolve against DevBar's directory")
     precondition(Discovery.projectRoot("/opt/homebrew/bin/postgres") == nil)

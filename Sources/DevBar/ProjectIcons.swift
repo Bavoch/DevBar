@@ -107,10 +107,7 @@ enum ProjectIconResolver {
     }
 
     private static func boundedData(_ url: URL, limit: Int) -> Data? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber, size.intValue <= limit else { return nil }
-        return try? Data(contentsOf: url)
+        ProjectProfiles.data(url, limit: limit)
     }
 
     private static func json(_ url: URL) -> [String: Any]? {

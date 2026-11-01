@@ -1,572 +1,581 @@
 import AppKit
-import SwiftUI
 
 @MainActor
 struct PanelProject {
     let path: String
     let name: String
     let detail: String
-    let running: Bool
-    let busy: Bool
-    let failed: Bool
+    let isRunning: Bool
     let icon: NSImage?
     let open: NSMenuItem?
     let control: NSMenuItem?
     let more: NSMenu
-    var freshness: RuntimeFreshness? = nil
 }
-
-// MARK: - 状态（纯函数可测）
 
 @MainActor
-final class PanelStore: ObservableObject {
-    @Published var models: [PanelProject] = []
-    @Published var runningCount = 0
-    @Published var scanError: String?
-    @Published var isScanning = false
-    /// 0 = 运行中，1 = 已停止
-    @Published var selectedTab = 0
-    @Published var maxHeight: CGFloat = 640
+private final class PanelScrollView: NSScrollView {
+    private static let gutter: CGFloat = 16
 
-    static let rowHeight: CGFloat = 48
-    static let chromeHeight: CGFloat = 114
-    static let minimumHeight: CGFloat = 190
-
-    var visible: [PanelProject] { models.filter { $0.running == (selectedTab == 0) } }
-    var runningLabel: String { "运行中 · \(models.filter(\.running).count)" }
-    var stoppedLabel: String { "已停止 · \(models.filter { !$0.running }.count)" }
-    /// 空态文案：错误优先，其次扫描中/暂无项目/对应 tab 的空态。
-    var placeholder: String? {
-        guard visible.isEmpty else { return nil }
-        if let scanError { return scanError }
-        if isScanning && models.isEmpty { return "扫描中…" }
-        if models.isEmpty { return "暂无项目" }
-        return selectedTab == 0 ? "暂无运行中的项目" : "暂无已停止的项目"
+    override func tile() {
+        super.tile()
+        // The list always ends at the original 16 pt panel inset. Its width
+        // never depends on overflow or the overlay scroller's visibility.
+        var viewport = contentView.frame
+        viewport.size.width = max(0, bounds.width - viewport.minX - Self.gutter)
+        contentView.frame = viewport
+        if let scroller = verticalScroller {
+            let width = NSScroller.scrollerWidth(for: .small, scrollerStyle: .overlay)
+            var frame = scroller.frame
+            frame.origin.x = bounds.maxX - width
+            frame.size.width = width
+            scroller.frame = frame
+        }
     }
-    var footerText: String { scanError != nil ? "检测失败" : "" }
-    var listHeight: CGFloat { visible.isEmpty ? 76 : CGFloat(visible.count) * Self.rowHeight }
-    var panelHeight: CGFloat { min(max(Self.minimumHeight, listHeight + Self.chromeHeight), max(Self.minimumHeight, maxHeight)) }
 }
-
-// MARK: - 行为路由（SwiftUI 按钮与自测共用）
 
 @MainActor
-enum PanelActions {
-    static func open(_ model: PanelProject, anchor: NSView?) {
-        guard let item = model.open else { return }
-        if let submenu = item.submenu, let anchor {
-            submenu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height + 3), in: anchor)
-        } else if let action = item.action {
-            NSApp.sendAction(action, to: item.target, from: item)
-        }
-    }
-    static func control(_ model: PanelProject) {
-        guard let item = model.control, item.isEnabled, let action = item.action else { return }
-        NSApp.sendAction(action, to: item.target, from: item)
-    }
-    static func more(_ model: PanelProject, anchor: NSView) {
-        model.more.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height), in: anchor)
+private final class PanelSearchField: NSSearchField {
+    override var needsPanelToBecomeKey: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeKey()
+        super.mouseDown(with: event)
     }
 }
-
-// MARK: - 徽章规则
-
-extension RuntimeFreshness {
-    /// nil = 不显示徽章；stale 橙色、unknown 灰色，failed 由详情行表达。
-    var badge: (symbol: String, warning: Bool)? {
-        switch state {
-        case .stale: return ("arrow.triangle.2.circlepath", true)
-        case .unknown: return ("questionmark.circle", false)
-        default: return nil
-        }
-    }
-}
-
-// MARK: - 颜色
-
-private enum PanelColors {
-    static let background = Color(red: 0.105, green: 0.109, blue: 0.116)
-    static let muted = Color(red: 0.56, green: 0.58, blue: 0.61)
-    static let accent = Color(red: 0.36, green: 0.83, blue: 0.94)
-    static let warning = Color(red: 1, green: 0.62, blue: 0.43)
-    static let backgroundNS = NSColor(srgbRed: 0.105, green: 0.109, blue: 0.116, alpha: 1)
-}
-
-// MARK: - 菜单锚点（NSMenu.popUp 需要 AppKit 视图坐标）
 
 @MainActor
-final class AnchorBox {
-    weak var view: NSView?
+private final class PanelButtonLabel: NSStackView {
+    // The entire label remains part of the parent button's click target.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
-
-private struct MenuAnchor: NSViewRepresentable {
-    let box: AnchorBox
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
-        box.view = view
-        return view
-    }
-    func updateNSView(_ nsView: NSView, context: Context) { box.view = nsView }
-}
-
-// MARK: - SwiftUI 视图
-
-private struct HoverIconButton: View {
-    let symbol: String
-    let label: String
-    var accented = false
-    var enabled = true
-    let action: () -> Void
-    @State private var hovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .medium))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .buttonStyle(.plain)
-        .frame(width: 32, height: 32)
-        .background(RoundedRectangle(cornerRadius: 10).fill(fill))
-        .foregroundStyle(accented ? PanelColors.accent : PanelColors.muted)
-        .opacity(enabled ? 1 : 0.35)
-        .onHover { hovered = $0 }
-        .help(label)
-        .accessibilityLabel(label)
-    }
-
-    private var fill: Color {
-        if accented { return PanelColors.accent.opacity(hovered ? 0.21 : 0.10) }
-        return Color.white.opacity(hovered ? 0.10 : 0)
-    }
-}
-
-private struct PanelRowView: View {
-    let model: PanelProject
-    private let moreBox = AnchorBox()
-
-    var body: some View {
-        HStack(spacing: 0) {
-            icon
-                .padding(.leading, 12)
-                .frame(width: 38, alignment: .leading)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) { nameButton; badge }
-                Text(model.detail)
-                    .font(.system(size: 11))
-                    .foregroundStyle(model.failed ? PanelColors.warning : PanelColors.muted)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.leading, 0)
-            if model.busy {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 32, height: 32)
-                    .padding(.trailing, 6)
-            } else if let control = model.control {
-                HoverIconButton(
-                    symbol: model.running ? "stop.fill" : "play.fill",
-                    label: control.title.isEmpty ? (model.running ? "停止" : "运行") : control.title,
-                    accented: !model.running,
-                    enabled: control.isEnabled,
-                    action: { PanelActions.control(model) })
-                    .padding(.trailing, 6)
-            } else {
-                Color.clear.frame(width: 38, height: 1)
-            }
-            HoverIconButton(symbol: "ellipsis", label: "更多") {
-                if let anchor = moreBox.view { PanelActions.more(model, anchor: anchor) }
-            }
-            .background(MenuAnchor(box: moreBox))
-        }
-        .frame(height: PanelStore.rowHeight)
-    }
-
-    private var icon: some View {
-        Group {
-            if let image = model.icon {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                Color.clear
-            }
-        }
-        .frame(width: 26, height: 26)
-    }
-
-    private var nameEnabled: Bool { !model.busy && (model.open?.isEnabled ?? false) }
-
-    private var nameButton: some View {
-        Button(action: { PanelActions.open(model, anchor: nameAnchorBox.view) }) {
-            Text(model.name)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .buttonStyle(.plain)
-        .disabled(!nameEnabled)
-        .opacity(nameEnabled ? 1 : 0.4)
-        .help(model.open?.title ?? "")
-        .accessibilityLabel(model.open.map { "\($0.title) · \(model.name)" } ?? model.name)
-        .background(MenuAnchor(box: nameAnchorBox))
-    }
-
-    private let nameAnchorBox = AnchorBox()
-
-    @ViewBuilder
-    private var badge: some View {
-        if let freshness = model.freshness, let rule = freshness.badge {
-            Image(systemName: rule.symbol)
-                .font(.system(size: 11))
-                .foregroundStyle(rule.warning ? PanelColors.warning : PanelColors.muted)
-                .help(freshness.title + "：" + freshness.reason)
-                .accessibilityLabel(freshness.title)
-        }
-    }
-}
-
-private struct PanelRootView: View {
-    @ObservedObject var store: PanelStore
-    let onAdd: () -> Void
-    let onRefresh: () -> Void
-    let onMoreMenu: (NSView) -> Void
-    let headerMoreBox: AnchorBox
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        if let placeholder = store.placeholder {
-                            Text(placeholder)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(PanelColors.muted)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .padding(.top, 4)
-                                .id("placeholder")
-                        }
-                        ForEach(store.visible, id: \.path) { model in
-                            PanelRowView(model: model)
-                        }
-                    }
-                    .id("list-top")
-                }
-                .onChange(of: store.selectedTab) { _ in
-                    proxy.scrollTo("list-top", anchor: .top)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
-            .padding(.bottom, 6)
-            footer
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(PanelColors.background)
-    }
-
-    private var header: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text("DEVBAR")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(PanelColors.muted)
-                Spacer()
-            }
-            .padding(.horizontal, 24)
-            HStack(spacing: 8) {
-                Picker("", selection: $store.selectedTab) {
-                    Text(store.runningLabel).tag(0)
-                    Text(store.stoppedLabel).tag(1)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 260)
-                .labelsHidden()
-                .accessibilityLabel("项目运行状态")
-                Spacer()
-                HoverIconButton(symbol: "plus", label: "添加项目", accented: true, action: onAdd)
-            }
-            .padding(.leading, 22)
-            .padding(.trailing, 13)
-        }
-        .padding(.top, 10)
-    }
-
-    private var footer: some View {
-        VStack(spacing: 0) {
-            Rectangle()
-                .fill(Color.white.opacity(0.065))
-                .frame(height: 1)
-                .padding(.horizontal, 24)
-            HStack(spacing: 10) {
-                Text(store.footerText)
-                    .font(.system(size: 11))
-                    .foregroundStyle(store.scanError != nil ? PanelColors.warning : PanelColors.muted)
-                    .help(store.scanError ?? "")
-                Spacer()
-                HoverIconButton(symbol: "arrow.clockwise", label: "刷新", action: onRefresh)
-                HoverIconButton(symbol: "ellipsis", label: "更多") {
-                    if let anchor = headerMoreBox.view { onMoreMenu(anchor) }
-                }
-                .background(MenuAnchor(box: headerMoreBox))
-            }
-            .padding(.leading, 26)
-            .padding(.trailing, 13)
-            .padding(.vertical, 4)
-        }
-    }
-}
-
-// MARK: - 薄壳：承载 NSHostingView，负责尺寸/键盘/渲染
 
 @MainActor
-final class ProjectPanelView: NSView {
-    override var acceptsFirstResponder: Bool { true }
-    let store = PanelStore()
-    private var hosting: NSHostingView<PanelRootView>!
-    private var cancellable: Any?
-    private let headerMoreBox = AnchorBox()
-    var onResize: ((NSSize) -> Void)?
-    var onClose: (() -> Void)?
-    var onQuit: (() -> Void)?
-    var onAdd: (() -> Void)?
-    var onRefresh: (() -> Void)?
-    var onMoreMenu: ((NSView) -> Void)?
-    private(set) var projectCount = 0
-    private(set) var paths: [String] = []
+private final class PanelButton: NSButton {
+    var handler: ((NSButton) -> Void)?
+    private var drawsActionSurface = false
+    override var needsPanelToBecomeKey: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 280))
-        appearance = NSAppearance(named: .darkAqua)
-        wantsLayer = true
-        layer?.backgroundColor = PanelColors.backgroundNS.cgColor
-        layer?.cornerRadius = 20
-        layer?.masksToBounds = true
-        let root = PanelRootView(
-            store: store,
-            onAdd: { [weak self] in self?.onAdd?() },
-            onRefresh: { [weak self] in self?.onRefresh?() },
-            onMoreMenu: { [weak self] anchor in self?.onMoreMenu?(anchor) },
-            headerMoreBox: headerMoreBox)
-        hosting = NSHostingView(rootView: root)
-        addSubview(hosting)
-        cancellable = store.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.syncSize() }
+    init(title: String, symbol: String? = nil, handler: @escaping (NSButton) -> Void) {
+        super.init(frame: .zero)
+        self.title = symbol == nil ? title : ""
+        self.handler = handler
+        bezelStyle = .rounded
+        controlSize = .large
+        heightAnchor.constraint(equalToConstant: 32).isActive = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        if let symbol {
+            image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            imagePosition = .imageOnly
+            widthAnchor.constraint(equalToConstant: 32).isActive = true
         }
+        toolTip = title
+        setAccessibilityLabel(title)
+        target = self
+        action = #selector(invoke)
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func update(_ models: [PanelProject], running: Int, error: String?, scanning: Bool, maxHeight: CGFloat = 640) {
-        store.models = models
-        store.runningCount = running
-        store.scanError = error
-        store.isScanning = scanning
-        store.maxHeight = maxHeight
-        projectCount = models.count
-        paths = models.map(\.path)
-        syncSize()
+    func actionSurface() -> NSView {
+        // A shared neutral surface keeps toolbar and row actions consistent.
+        // Per-button glass samples the backdrop and can change shade by row.
+        drawsActionSurface = true
+        bezelStyle = .regularSquare
+        isBordered = false
+        contentTintColor = .labelColor
+        if imagePosition != .imageOnly {
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 56).isActive = true
+        }
+        return self
     }
 
-    func showRunning() { store.selectedTab = 0 }
-
-    /// 高度公式与面板行为一致：内容驱动，受 maxHeight 钳制。
-    private func syncSize() {
-        let size = NSSize(width: 380, height: store.panelHeight)
-        guard size != frame.size else { return }
-        setFrameSize(size)
-        needsLayout = true
-        layoutSubtreeIfNeeded()
-        onResize?(frame.size)
+    func setActionLabel(symbol: String) {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = isEnabled ? .labelColor : .disabledControlTextColor
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        icon.contentTintColor = label.textColor
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        let content = PanelButtonLabel(views: [icon, label])
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 4
+        // Use a shared visual center instead of NSButtonCell's image baseline,
+        // which positions small SF Symbols below Chinese button text.
+        title = ""
+        addSubview(content)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 10),
+            icon.heightAnchor.constraint(equalToConstant: 10),
+            content.centerXAnchor.constraint(equalTo: centerXAnchor),
+            content.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
     }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if drawsActionSurface {
+            let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let highContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            // Opaque fills do not pick up different materials behind each row.
+            let level: CGFloat
+            if dark {
+                level = isHighlighted && isEnabled ? 0.25 : (highContrast ? 0.22 : 0.16)
+            } else {
+                level = isHighlighted && isEnabled ? 0.78 : (highContrast ? 0.82 : 0.90)
+            }
+            NSColor(white: level, alpha: 1).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16).fill()
+        }
+        super.draw(dirtyRect)
+    }
+
+    @objc private func invoke() { handler?(self) }
+}
+
+/// AppKit owns control behavior; DevBar shares one surface across action buttons.
+@MainActor
+final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    private let search = PanelSearchField()
+    private let tabs = NSSegmentedControl(labels: ["运行中", "已停止"], trackingMode: .selectOne, target: nil, action: nil)
+    private let status = NSTextField(labelWithString: "项目")
+    private let table = NSTableView()
+    private let scroll = PanelScrollView()
+    private let placeholder = NSTextField(labelWithString: "添加你的第一个项目")
+    private let stack = NSStackView()
+    private let emptyState = NSStackView()
+    private let emptyIcon = NSImageView()
+    private let emptyHint = NSTextField(wrappingLabelWithString: "点右上角 ＋ 添加本地项目")
+    private var models: [PanelProject] = []
+    private(set) var visible: [PanelProject] = []
+    var onAdd: (() -> Void)?
+    var onRefresh: (() -> Void)?
+    var onMore: ((NSView) -> Void)?
+    var onClose: (() -> Void)?
+    var onResize: ((NSSize) -> Void)?
+    override var acceptsFirstResponder: Bool { true }
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 280))
+        let title = NSTextField(labelWithString: "DevBar")
+        title.font = .systemFont(ofSize: 17, weight: .semibold)
+        status.font = .systemFont(ofSize: 11, weight: .medium)
+        status.textColor = .secondaryLabelColor
+        let identity = NSStackView(views: [title, status])
+        identity.orientation = .vertical
+        identity.alignment = .leading
+        identity.spacing = 3
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [identity, spacer,
+            PanelButton(title: "添加项目", symbol: "plus") { [weak self] _ in self?.onAdd?() }.actionSurface(),
+            PanelButton(title: "刷新", symbol: "arrow.clockwise") { [weak self] _ in self?.onRefresh?() }.actionSurface(),
+            PanelButton(title: "更多", symbol: "ellipsis") { [weak self] button in self?.onMore?(button) }.actionSurface()])
+        header.orientation = .horizontal
+        header.distribution = .fill
+        header.alignment = .centerY
+        header.spacing = 8
+        header.heightAnchor.constraint(equalToConstant: 44).isActive = true
+
+        search.placeholderString = "搜索项目"
+        search.controlSize = .large
+        search.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        search.setAccessibilityLabel("搜索项目")
+        search.sendsSearchStringImmediately = true
+        search.delegate = self
+        search.target = self
+        search.action = #selector(searchChanged)
+
+        tabs.controlSize = .large
+        tabs.segmentStyle = .automatic
+        tabs.selectedSegmentBezelColor = nil
+        tabs.segmentDistribution = .fillEqually
+        tabs.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        tabs.selectedSegment = 0
+        tabs.target = self
+        tabs.action = #selector(tabChanged)
+        tabs.setAccessibilityLabel("项目运行状态")
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("project"))
+        column.width = 356
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.headerView = nil
+        table.style = .plain
+        table.backgroundColor = .clear
+        table.selectionHighlightStyle = .none
+        table.rowHeight = 52
+        table.intercellSpacing = .zero
+        table.dataSource = self
+        table.delegate = self
+        table.setAccessibilityLabel("项目")
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScroller?.controlSize = .small
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        placeholder.font = .systemFont(ofSize: 14, weight: .semibold)
+        placeholder.textColor = .labelColor
+        placeholder.alignment = .center
+        emptyIcon.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: nil)
+        emptyIcon.contentTintColor = .secondaryLabelColor
+        emptyIcon.symbolConfiguration = .init(pointSize: 28, weight: .light)
+        emptyIcon.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        emptyHint.font = .systemFont(ofSize: 12)
+        emptyHint.textColor = .secondaryLabelColor
+        emptyHint.alignment = .center
+        emptyState.orientation = .vertical
+        emptyState.alignment = .centerX
+        emptyState.spacing = 8
+        for item in [emptyIcon, placeholder, emptyHint] { emptyState.addArrangedSubview(item) }
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        // Only the scroll view extends to the panel edge. Its fixed gutter
+        // keeps the original row inset whether the thin scrollbar is visible or not.
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 0)
+        for view in [header, search, tabs, emptyState, scroll] {
+            stack.addArrangedSubview(view)
+            let horizontalInset: CGFloat = view === scroll ? 16 : 32
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -horizontalInset).isActive = true
+        }
+        addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        emptyState.isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
 
     override func layout() {
         super.layout()
-        hosting.frame = bounds
+        // NSScrollView owns the viewport; keep its document table at that width
+        // so trailing actions stop before the separate scrollbar lane.
+        let width = scroll.contentSize.width
+        if width > 0, table.frame.width != width {
+            let inset = table.rect(ofColumn: 0).minX
+            table.tableColumns[0].width = max(40, width - inset * 2)
+            table.setFrameSize(NSSize(width: width, height: table.frame.height))
+        }
     }
 
+    func update(_ models: [PanelProject], running: Int, error: String?, scanning: Bool) {
+        self.models = models
+        let runningCount = models.filter(\.isRunning).count
+        tabs.setLabel("运行中 (\(runningCount))", forSegment: 0)
+        tabs.setLabel("已停止 (\(models.count - runningCount))", forSegment: 1)
+        status.stringValue = error == nil ? (scanning ? "正在更新…" : (running == 0 ? "本地项目" : "\(running) 个运行中")) : "状态检测失败"
+        status.toolTip = error
+        search.isHidden = models.isEmpty
+        placeholder.stringValue = error ?? (scanning ? "正在读取项目…" : "添加你的第一个项目")
+        filter()
+    }
+
+    private func filter() {
+        let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        tabs.isHidden = models.isEmpty || !query.isEmpty
+        visible = models.filter { model in
+            if query.isEmpty { return model.isRunning == (tabs.selectedSegment == 0) }
+            return [model.name, model.path, model.detail].contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+        emptyState.isHidden = !visible.isEmpty
+        if visible.isEmpty && !models.isEmpty {
+            placeholder.stringValue = query.isEmpty
+                ? (tabs.selectedSegment == 0 ? "暂无运行中的项目" : "暂无已停止的项目")
+                : "没有匹配的项目"
+        }
+        emptyIcon.image = NSImage(systemSymbolName: query.isEmpty ? "folder.badge.plus" : "magnifyingglass", accessibilityDescription: nil)
+        emptyHint.stringValue = models.isEmpty ? "点右上角 ＋ 添加本地项目"
+            : (query.isEmpty ? (tabs.selectedSegment == 0 ? "在已停止的项目中选择运行" : "运行中的项目会显示在另一栏") : "试试其他名称、目录或地址")
+        if status.toolTip != nil {
+            placeholder.stringValue = "暂时无法读取项目"
+            emptyIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+            emptyHint.stringValue = "可点击右上角刷新重试"
+        }
+        scroll.isHidden = visible.isEmpty
+        table.reloadData()
+        let available = (window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let maximumHeight = max(160, min(560, available * 0.7))
+        let chrome: CGFloat = search.isHidden ? 88 : (tabs.isHidden ? 132 : 176)
+        let height = min(chrome + (visible.isEmpty ? 120 : CGFloat(visible.count) * table.rowHeight), maximumHeight)
+        let size = NSSize(width: 400, height: height)
+        if frame.size != size { setFrameSize(size); onResize?(size) }
+    }
+    @objc private func searchChanged() { filter() }
+    @objc private func tabChanged() {
+        filter()
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    func controlTextDidChange(_ notification: Notification) { filter() }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard selector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+        escape()
+        return true
+    }
+    private func escape() {
+        if search.stringValue.isEmpty { onClose?() }
+        else { search.stringValue = ""; filter() }
+    }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onClose?(); return }
-        if event.modifierFlags.contains(.command) {
-            switch event.charactersIgnoringModifiers {
-            case "n": onAdd?()
-            case "r": onRefresh?()
-            case "q": onQuit?()
-            default: super.keyDown(with: event)
-            }
-        } else { super.keyDown(with: event) }
+        if event.keyCode == 53 { escape() }
+        else if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "f" {
+            window?.makeKey(); window?.makeFirstResponder(search)
+        } else if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "n" { onAdd?() }
+        else if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "r" { onRefresh?() }
+        else { super.keyDown(with: event) }
+    }
+    func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let model = visible[row]
+        let icon = NSImageView()
+        icon.image = model.icon
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        let name = PanelButton(title: model.name) { button in Self.perform(model.open, anchor: button) }
+        name.constraints.first(where: { $0.firstAttribute == .height })?.constant = 18
+        name.bezelStyle = .inline
+        name.isBordered = false
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        name.alignment = .left
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        name.isEnabled = model.open?.isEnabled == true
+        let detail = NSTextField(labelWithString: model.detail)
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = model.detail
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // Unavailable opening is an action state, not a disabled project title.
+        let titleLabel = NSTextField(labelWithString: model.name)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.toolTip = model.name
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        name.toolTip = "打开 \(model.name)"
+        let titleView: NSView = model.open?.isEnabled == true ? name : titleLabel
+        let labels = NSStackView(views: [titleView, detail])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 3
+        labels.widthAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+        labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleView.widthAnchor.constraint(equalTo: labels.widthAnchor).isActive = true
+        detail.widthAnchor.constraint(equalTo: labels.widthAnchor).isActive = true
+        let more = PanelButton(title: "\(model.name)的更多操作", symbol: "ellipsis") { button in
+            model.more.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+        }
+        var views: [NSView] = [icon, labels]
+        if let action = model.control {
+            let button = PanelButton(title: action.title) { sender in Self.perform(action, anchor: sender) }
+            button.widthAnchor.constraint(equalToConstant: 76).isActive = true
+            button.isEnabled = action.isEnabled && action.action != nil
+            button.setActionLabel(symbol: model.isRunning ? "stop.fill" : "play.fill")
+            views.append(button.actionSurface())
+        }
+        views.append(more.actionSurface())
+        let content = NSStackView(views: views)
+        content.orientation = .horizontal
+        content.distribution = .fill
+        content.alignment = .centerY
+        content.spacing = 10
+        let cell = NSTableCellView()
+        cell.addSubview(content)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+            content.topAnchor.constraint(equalTo: cell.topAnchor),
+            content.bottomAnchor.constraint(equalTo: cell.bottomAnchor),
+        ])
+        return cell
+    }
+    private static func perform(_ item: NSMenuItem?, anchor: NSView) {
+        guard let item, item.isEnabled else { return }
+        if let submenu = item.submenu { submenu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height), in: anchor) }
+        else if let action = item.action { NSApp.sendAction(action, to: item.target, from: item) }
     }
 
-    static func verify(output: String?) throws {
-        let recorder = PanelActionRecorder()
-        func item(_ value: String) -> NSMenuItem {
-            let item = NSMenuItem(title: value == "run" ? "运行" : value == "stop" ? "停止" : value, action: #selector(PanelActionRecorder.record(_:)), keyEquivalent: "")
-            item.target = recorder
-            item.representedObject = value
-            return item
-        }
-        func model(_ path: String, running: Bool = true, busy: Bool = false, failed: Bool = false, open: NSMenuItem? = nil) -> PanelProject {
-            PanelProject(path: path, name: path, detail: failed ? "启动失败" : (busy ? "启动中…" : (running ? "localhost:3000" : "已停止")),
-                running: running, busy: busy, failed: failed,
-                icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil),
-                open: open, control: item(running ? "stop" : "run"), more: NSMenu())
-        }
-
-        // 1) 状态纯函数
-        let store = PanelStore()
-        store.models = [model("Running", open: item("open")), model("Stopped", running: false)]
-        precondition(store.visible.map(\.path) == ["Running"])
-        precondition(store.runningLabel == "运行中 · 1" && store.stoppedLabel == "已停止 · 1")
-        precondition(store.placeholder == nil && store.footerText == "")
-        store.selectedTab = 1
-        precondition(store.visible.map(\.path) == ["Stopped"])
-        store.models = []
-        precondition(store.placeholder == "暂无项目", "空项目与所选 tab 无关")
-        store.isScanning = true
-        precondition(store.placeholder == "扫描中…")
-        store.scanError = "权限不足"
-        precondition(store.placeholder == "权限不足" && store.footerText == "检测失败")
-        store.scanError = nil
-        store.isScanning = false
-        store.models = [model("Only running")]
-        precondition(store.placeholder == "暂无已停止的项目")
-
-        // 2) 行为路由：open / control / 禁用保护
-        let running = model("Running", open: item("open"))
-        PanelActions.open(running, anchor: nil)
-        PanelActions.control(running)
-        precondition(recorder.values == ["open", "stop"])
-        let stopped = model("Stopped", running: false)
-        PanelActions.control(stopped)
-        precondition(recorder.values.last == "run")
-        let disabled = NSMenuItem(title: "停止", action: #selector(PanelActionRecorder.record(_:)), keyEquivalent: "")
-        disabled.target = recorder; disabled.representedObject = "stop"; disabled.isEnabled = false
-        PanelActions.control(PanelProject(path: "X", name: "X", detail: "", running: true, busy: false, failed: false, icon: nil, open: nil, control: disabled, more: NSMenu()))
-        precondition(recorder.values.count == 3, "禁用按钮不得触发")
-
-        // 3) 徽章规则
-        precondition(RuntimeFreshness(state: .stale, reason: "r").badge?.warning == true)
-        precondition(RuntimeFreshness(state: .stale, reason: "r").badge?.symbol == "arrow.triangle.2.circlepath")
-        precondition(RuntimeFreshness(state: .unknown, reason: "r").badge?.warning == false)
-        precondition(RuntimeFreshness(state: .current, reason: "r").badge == nil)
-        precondition(RuntimeFreshness(state: .failed, reason: "r").badge == nil)
-
-        // 4) 壳层：高度钳制、tab 过滤、键盘、渲染
+    static func verify(output: String? = nil) {
         let view = ProjectPanelView()
-        let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
-        window.contentView = view
-        view.update([model("Running", open: item("open")), model("Stopped", running: false)], running: 1, error: nil, scanning: false)
-        precondition(view.frame.height == 190)
-        view.update((0..<40).map { model("Project \($0)", running: $0 < 20) }, running: 20, error: nil, scanning: false, maxHeight: 580)
-        precondition(view.frame.height == 580)
-        view.update([model("Only running")], running: 1, error: nil, scanning: false)
-        precondition(view.frame.height == 190)
-        precondition(view.paths == ["Only running"] && view.projectCount == 1)
-        view.store.selectedTab = 1
-        precondition(view.store.placeholder == "暂无已停止的项目")
-        view.showRunning()
-        precondition(view.store.selectedTab == 0)
-
-        var flags = Set<String>()
-        view.onClose = { flags.insert("close") }
-        view.onAdd = { flags.insert("add") }
-        view.onRefresh = { flags.insert("refresh") }
-        view.onQuit = { flags.insert("quit") }
-        func key(_ characters: String, _ modifiers: NSEvent.ModifierFlags, _ code: UInt16) {
-            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: 0, context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code) else { return }
-            view.keyDown(with: event)
-        }
-        key("\u{1b}", [], 53)
-        key("n", .command, 45)
-        key("r", .command, 15)
-        key("q", .command, 12)
-        precondition(flags == ["close", "add", "refresh", "quit"], String(describing: flags))
-
+        let window = ProjectPanelWindow()
+        window.install(view)
+        let menu = NSMenu()
+        let control = NSMenuItem(title: "运行", action: nil, keyEquivalent: "")
+        let models = [PanelProject(path: "/web", name: "Web", detail: "已停止", isRunning: false, icon: nil, open: nil, control: control, more: menu),
+                      PanelProject(path: "/api", name: "API", detail: "运行中", isRunning: true, icon: nil, open: nil, control: control, more: menu)]
+        view.update(models, running: 1, error: nil, scanning: false)
+        precondition(view.visible.map(\.path) == ["/api"])
+        view.tabs.selectedSegment = 1; view.tabChanged()
+        precondition(view.visible.map(\.path) == ["/web"])
+        view.search.stringValue = "WEB"; view.filter()
+        precondition(view.visible.map(\.path) == ["/web"] && view.tabs.isHidden)
+        view.tabs.selectedSegment = 0; view.tabChanged()
+        precondition(view.visible.map(\.path) == ["/web"] && view.tabs.isHidden)
+        view.tabs.selectedSegment = 1; view.tabChanged()
+        view.search.stringValue = "API"; view.filter()
+        precondition(view.visible.map(\.path) == ["/api"] && view.tabs.isHidden)
+        view.search.stringValue = "/"; view.filter()
+        precondition(view.visible.map(\.path) == ["/web", "/api"] && view.tabs.isHidden)
+        view.escape(); precondition(view.visible.map(\.path) == ["/web"] && !view.tabs.isHidden)
+        view.search.stringValue = "missing"; view.filter()
+        precondition(view.visible.isEmpty && !view.emptyState.isHidden)
+        view.escape()
+        view.update(Array(repeating: models[0], count: 40), running: 0, error: nil, scanning: false)
+        precondition(view.visible.count == 40 && view.frame.height <= 560)
+        window.setContentSize(view.frame.size)
+        view.layoutSubtreeIfNeeded()
+        view.scroll.tile()
+        let overflowingWidth = view.scroll.contentSize.width
+        let scroller = view.scroll.verticalScroller!
+        precondition(view.scroll.contentView.frame.maxX <= scroller.frame.minX,
+                     "The scrollbar must stay outside project rows")
+        // The native overlay hit area is 15 pt; the visible thumb is narrower.
+        precondition(view.scroll.scrollerStyle == .overlay && scroller.frame.width <= 16,
+                     "Use the thin overlay thumb inside its fixed gutter")
+        view.update([models[0]], running: 0, error: nil, scanning: false)
+        window.setContentSize(view.frame.size)
+        view.layoutSubtreeIfNeeded()
+        view.scroll.tile()
+        precondition(abs(view.scroll.contentSize.width - overflowingWidth) < 0.5,
+                     "Scrollbar visibility must not change the list width")
+        precondition(abs(overflowingWidth - 368) < 0.5,
+                     "Keep the original 16 pt row insets in the 400 pt panel")
+        view.update(models, running: 1, error: nil, scanning: false)
+        window.setContentSize(view.frame.size)
+        view.layoutSubtreeIfNeeded()
+        precondition(view.table.numberOfRows == 1 && view.table.headerView == nil)
+        precondition(window.styleMask.contains(.nonactivatingPanel) && window.becomesKeyOnlyIfNeeded)
+        // Synthetic input stays on an offscreen accessory panel; no visible UI.
+        let policy = NSApp.activationPolicy()
+        NSApp.setActivationPolicy(.accessory)
+        window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
+        let foregroundOnOpen = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        window.show(below: NSView())
+        precondition(window.isKeyWindow && window.firstResponder === view,
+                     "Opening the panel must establish active appearance without starting search editing")
+        precondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == foregroundOnOpen,
+                     "Opening the nonactivating panel must preserve the foreground application")
         if let output {
-            var stale = model("Running", open: item("open"))
-            stale.freshness = RuntimeFreshness(state: .stale, reason: "本地源码已变")
-            view.update([model("Web project", open: item("open")), stale, model("Starting", busy: true), model("Failed", running: false, failed: true), model("Stopped", running: false)], running: 3, error: nil, scanning: false)
+            let stop = NSMenuItem(title: "停止", action: #selector(NSResponder.cancelOperation(_:)), keyEquivalent: "")
+            let open = NSMenuItem(title: "打开", action: #selector(NSResponder.cancelOperation(_:)), keyEquivalent: "")
+            let disabledOpen = NSMenuItem(title: "打开", action: nil, keyEquivalent: "")
+            disabledOpen.isEnabled = false
+            let samples = [
+                PanelProject(path: "/preview/desktop", name: "桌面应用", detail: "开发模式 · 运行中", isRunning: true,
+                    icon: NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil), open: disabledOpen, control: stop, more: menu),
+                PanelProject(path: "/preview/web", name: "项目网站", detail: "localhost:5173", isRunning: true,
+                    icon: NSImage(systemSymbolName: "globe", accessibilityDescription: nil), open: open, control: stop, more: menu),
+                PanelProject(path: "/preview/long", name: "名称很长的本地开发项目与管理工具", detail: "localhost:8080/api/development/health", isRunning: true,
+                    icon: NSImage(systemSymbolName: "terminal", accessibilityDescription: nil), open: nil, control: stop, more: menu),
+            ]
+            let base = URL(fileURLWithPath: output).deletingPathExtension().path
+            view.onResize = { window.setContentSize($0) }
+            for (appearance, suffix) in [(NSAppearance.Name.aqua, ""), (.darkAqua, "-dark")] {
+                window.appearance = NSAppearance(named: appearance)
+                view.tabs.selectedSegment = 0
+                view.update(samples, running: 3, error: nil, scanning: false)
+                PanelPreview.write(view, path: base + suffix + ".png")
+                // Verify real layout, including compression under a long name.
+                for row in 0..<view.visible.count {
+                    let cell = view.table.view(atColumn: 0, row: row, makeIfNecessary: true)!
+                    precondition(!cell.hasAmbiguousLayout)
+                    let content = cell.subviews[0] as! NSStackView
+                    precondition(content.arrangedSubviews.last!.frame.maxX <= cell.bounds.width)
+                    precondition(content.arrangedSubviews[1].frame.width >= 100, "Project titles need readable space")
+                }
+                view.search.stringValue = "找不到的项目"; view.filter()
+                PanelPreview.write(view, path: base + "-search" + suffix + ".png")
+                view.search.stringValue = ""
+                view.update([], running: 0, error: nil, scanning: false)
+                PanelPreview.write(view, path: base + "-empty" + suffix + ".png")
+                ProjectEditor.verifyAppearance(path: base + "-settings" + suffix + ".png", appearance: appearance)
+            }
+            view.onResize = nil
+            view.tabs.selectedSegment = 1
+            view.update(models, running: 1, error: nil, scanning: false)
             window.setContentSize(view.frame.size)
-            try view.render(to: output)
-            view.store.selectedTab = 1
-            window.setContentSize(view.frame.size)
-            let stoppedOutput = URL(fileURLWithPath: output).deletingPathExtension().path + "-stopped.png"
-            try view.render(to: stoppedOutput)
+            view.layoutSubtreeIfNeeded()
+        }
+        let foreground = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        var refreshed = 0
+        view.onRefresh = { refreshed += 1 }
+        func findRefresh(_ root: NSView) -> PanelButton? {
+            if let button = root as? PanelButton, button.toolTip == "刷新" { return button }
+            return root.subviews.compactMap { findRefresh($0) }.first
+        }
+        let button = findRefresh(view)!
+        let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        let time = ProcessInfo.processInfo.systemUptime
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: time,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: time + 0.05,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0)!
+        NSApp.postEvent(up, atStart: true)
+        window.sendEvent(down)
+        if let pending = NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true) { window.sendEvent(pending) }
+        precondition(refreshed == 1 && window.isKeyWindow && window.firstResponder === view,
+                     "Toolbar buttons must preserve panel activity without starting search editing")
+        precondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == foreground)
+        // The window is already key; search only changes the first responder.
+        window.makeFirstResponder(view.search)
+        precondition(window.isKeyWindow && window.firstResponder is NSText, "Native search must support text editing without changing window activity")
+        let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: time + 0.1,
+            windowNumber: window.windowNumber, context: nil, characters: "w", charactersIgnoringModifiers: "w", isARepeat: false, keyCode: 13)!
+        window.sendEvent(key)
+        precondition(view.visible.map(\.path) == ["/web"], "Typing must filter projects")
+        precondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == foreground)
+        if let output {
+            let base = URL(fileURLWithPath: output).deletingPathExtension().path
+            for (appearance, suffix) in [(NSAppearance.Name.aqua, ""), (.darkAqua, "-dark")] {
+                window.appearance = NSAppearance(named: appearance)
+                view.search.needsDisplay = true
+                PanelPreview.write(view, path: base + "-focused" + suffix + ".png")
+            }
         }
         window.orderOut(nil)
-        print("PASS: panel store filtering and empty/error states, action routing with disabled guard, badge rules, shell height clamp, keyboard shortcuts and PNG rendering")
-    }
-
-    func render(to path: String) throws {
-        layoutSubtreeIfNeeded()
-        guard let bitmap = bitmapImageRepForCachingDisplay(in: bounds) else { throw failure("无法渲染面板") }
-        cacheDisplay(in: bounds, to: bitmap)
-        guard let data = bitmap.representation(using: .png, properties: [:]) else { throw failure("无法保存预览") }
-        try data.write(to: URL(fileURLWithPath: path))
+        NSApp.setActivationPolicy(policy)
+        print("PASS: AppKit header/search/table/row controls; inline filtering and Esc; offscreen panel opening, toolbar click and search typing preserve active state and foreground application")
     }
 }
 
+/// Layout previews use an opaque semantic backing because bitmap caching cannot
+/// reproduce WindowServer's live backdrop/refraction. The app itself stays glass.
 @MainActor
-private final class PanelActionRecorder: NSObject {
-    var values: [String] = []
-    @objc func record(_ sender: NSMenuItem) { values.append(sender.representedObject as! String) }
-}
-
-// MARK: - Xcode Preview：用固定数据逐视图实时调试
-
-#if DEBUG
-@MainActor
-private func previewStore(tab: Int = 0) -> PanelStore {
-    let store = PanelStore()
-    func openItem() -> NSMenuItem { NSMenuItem(title: "打开网页", action: nil, keyEquivalent: "") }
-    func controlItem(_ running: Bool) -> NSMenuItem { NSMenuItem(title: running ? "停止" : "运行", action: nil, keyEquivalent: "") }
-    store.models = [
-        PanelProject(path: "/proj/web", name: "web", detail: "localhost:5173", running: true, busy: false, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: openItem(), control: controlItem(true), more: NSMenu(),
-            freshness: RuntimeFreshness(state: .current, reason: "开发会话运行中")),
-        PanelProject(path: "/proj/stale", name: "stale-app", detail: "localhost:3000", running: true, busy: false, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: openItem(), control: controlItem(true), more: NSMenu(),
-            freshness: RuntimeFreshness(state: .stale, reason: "本地源码已变")),
-        PanelProject(path: "/proj/busy", name: "building", detail: "启动中…", running: true, busy: true, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: openItem(), control: controlItem(true), more: NSMenu()),
-        PanelProject(path: "/proj/failed", name: "broken", detail: "开发运行失败；修改后自动重试", running: true, busy: false, failed: true,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: openItem(), control: controlItem(true), more: NSMenu(),
-            freshness: RuntimeFreshness(state: .failed, reason: "开发命令已退出（1）")),
-        PanelProject(path: "/proj/stopped", name: "idle", detail: "npm run dev", running: false, busy: false, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: openItem(), control: controlItem(false), more: NSMenu()),
-    ]
-    store.selectedTab = tab
-    return store
-}
-
-#Preview("面板 · 运行中") {
-    PanelRootView(store: previewStore(), onAdd: {}, onRefresh: {}, onMoreMenu: { _ in }, headerMoreBox: AnchorBox())
-        .frame(width: 380, height: 320)
-}
-
-#Preview("面板 · 已停止") {
-    PanelRootView(store: previewStore(tab: 1), onAdd: {}, onRefresh: {}, onMoreMenu: { _ in }, headerMoreBox: AnchorBox())
-        .frame(width: 380, height: 220)
-}
-
-#Preview("单行 · 徽章与状态") {
-    VStack(spacing: 4) {
-        PanelRowView(model: PanelProject(path: "/a", name: "stale-project", detail: "localhost:4000", running: true, busy: false, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: NSMenuItem(title: "打开网页", action: nil, keyEquivalent: ""),
-            control: NSMenuItem(title: "停止", action: nil, keyEquivalent: ""), more: NSMenu(),
-            freshness: RuntimeFreshness(state: .stale, reason: "本地源码已变")))
-        PanelRowView(model: PanelProject(path: "/b", name: "busy-project", detail: "启动中…", running: true, busy: true, failed: false,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: nil,
-            control: NSMenuItem(title: "停止", action: nil, keyEquivalent: ""), more: NSMenu()))
-        PanelRowView(model: PanelProject(path: "/c", name: "failed-project", detail: "开发运行失败；修改后自动重试", running: true, busy: false, failed: true,
-            icon: NSImage(systemSymbolName: "folder", accessibilityDescription: nil), open: nil,
-            control: NSMenuItem(title: "停止", action: nil, keyEquivalent: ""), more: NSMenu()))
+enum PanelPreview {
+    static func write(_ view: NSView, path: String) {
+        view.window?.contentView?.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { preconditionFailure("Missing preview bitmap") }
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let image = NSImage(size: view.bounds.size)
+        image.lockFocus()
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            NSColor.windowBackgroundColor.setFill()
+            view.bounds.fill()
+        }
+        let foreground = NSImage(size: view.bounds.size)
+        foreground.addRepresentation(bitmap)
+        foreground.draw(in: view.bounds, from: .zero, operation: .sourceOver, fraction: 1)
+        image.unlockFocus()
+        let result = NSBitmapImageRep(data: image.tiffRepresentation!)!
+        try! result.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
     }
-    .frame(width: 348)
-    .background(PanelColors.background)
 }
-#endif

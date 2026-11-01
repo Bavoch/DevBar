@@ -1,0 +1,16 @@
+{
+  "source": "docs/brand/devbar-logo-concept-02.png",
+  "output": "Sources/DevBar/Resources/StatusBarIconTemplate.png",
+  "pixels": [
+    36,
+    36
+  ],
+  "points": [
+    18,
+    18
+  ],
+  "template": true,
+  "color": "white",
+  "background": "transparent",
+  "aperture": "transparent"
+}

@@ -2,5 +2,5 @@
 import PackageDescription
 
 let package = Package(name: "DevBar", platforms: [.macOS(.v13)], targets: [
-    .executableTarget(name: "DevBar")
+    .executableTarget(name: "DevBar", resources: [.copy("Resources/StatusBarIconTemplate.png")])
 ])
