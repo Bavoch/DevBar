@@ -1,32 +1,20 @@
-# Platform acceptance boundaries
+# 项目与平台边界
 
-DevBar identifies project types separately from verifying a selected running
-instance. A configured target is not an automatic claim that every project or
-platform is accepted. `current` requires a successful sync receipt and live
-read-only status proof. No local sync publishes a production service or store app.
+识别项目、运行命令和验收实际应用是三件不同的事。普通运行的状态表示本地运行事实，不声称业务功能或代码版本已经验收。自动适配优先使用项目声明的入口，不执行发布或猜测安装替换。
 
-| Runtime | Built-in driver | Acceptance on this Mac / CI |
+| 项目 | 普通运行方式 | 需要的条件与验证 |
 | --- | --- | --- |
-| macOS packaged desktop | macBundle | Native background v1→v2, exact executable and complete installed bundle, rollback and source races |
-| Local web / service / development shell | process | Real HTTP application revision, nonce and process proof; missing proof remains runningUnverified |
-| Chromium extension | extension | Real dedicated headless Chromium worker and extension document |
-| iOS simulator | iosSimulator | Real compilation/install/update, installed content and app-written PID/revision, preserved data |
-| Android APK | androidDevice | Real APK v1→v2 on headless ARM64 emulator, installed APK hash and app-written proof; physical Android hardware not connected |
-| Physical iOS | iosDevice | Dedicated devicectl install/launch/data-container driver and SDK compiled; paired iPhone/iPad offline, physical acceptance remains pending |
-| Windows | windowsSSH | Real Windows Server 2025: native lifecycle, SSH/SFTP, connection-independent background process and nonzero interactive desktop session verified |
-| Blender scripts | blender | Actual Blender background host v1→v2 and existing morph project executed; existing foreground document is not reloaded |
-| OMP extensions | omp | Actual OMP RPC extension load/reload; existing usage footer project configured and verified in a separate host |
-| DSH client plugins | dsh | Official isolated web profile plus headless Chromium; actual client apply and v1→v2 verified |
-| Local Compose services | dockerCompose | Actual Linux VM/images/containers, app proof, replacement, preserved volume and stop; no remote Docker or bind-mounted code claim |
-| WeChat mini program | No accepted built-in driver yet | Installed official CLI would launch its IDE when absent. No real host acceptance under the required headless-only testing policy |
-| Other containers / custom vendor hosts | external extension protocol | An integration interface alone does not count as tested vendor support |
-| Libraries / assets / archives | No runtime claimed | Read-only classification; consumer application or host must be explicitly selected |
+| Web / API / Node / Python | 项目已有 dev/start 或确认的源码入口，监听与热更新由项目自身负责 | 相应工具与依赖；实际网页入口、失败恢复、独立停止 |
+| Swift / Rust / Go | 可确定的源码目标，重新编译并运行 | 相应编译工具；编译成功不等于应用功能通过 |
+| 静态网页 | 随包本地服务器，保留具体文档入口 | Python；文件变化、正确 URL 与停止 |
+| Electron / Tauri / macOS | 项目声明的开发入口或可确认的原生构建目标 | 对应工具链；准确应用实例、安装版冲突隔离、权限归属 |
+| 多项目工作区 | 工程声明的子项目分别发现 | 每个入口在自己的工作目录验证，分别启停 |
+| 浏览器插件 | 专用隔离浏览器会话 | 相应 Chromium；无头测试使用独立资料目录，不触碰个人资料 |
+| iOS / Expo / Android / Flutter | 项目入口、模拟器或专用设备配置 | SDK、设备、签名等；模拟器不能替代真机验收 |
+| 微信小程序 | 编译入口与开发工具分开 | 厂商宿主；当前不声明完整宿主验收 |
+| Compose / Windows / Blender / OMP / DSH | 显式配置的可选驱动 | 独立宿主或设备端验收；接口存在不代表任意环境受支持 |
+| 库 / 素材 / 备份 / 空目录 | 无独立运行入口 | 不制造启动命令；可在使用它的应用中运行 |
 
-Native hosts and device apps expose a revision read from actual loaded code or a
-built-in revision resource. Expected nonce/target values alone are insufficient.
-Device SDK examples live in `drivers/sdk`; they do not bypass device trust,
-Developer Mode, signing/provisioning, Android authorization, or vendor login.
+高级集成仍支持 `.devbar.json` 的明确配置，协议见 [集成说明](sync-contract.md)。原生安装更新、设备部署及远程操作不参与普通运行的自动推断。
 
-Public release additionally requires a Developer ID Application certificate,
-notarization and Gatekeeper acceptance. The local signed build and CLI update
-path do not satisfy those distribution gates by themselves.
+本次开发在当前 Mac 上完成的具体证据见 [生产审查](production-review.md)。未在本轮连接或运行的设备、宿主、其他 CPU 与最低 macOS 版本保留待验收状态。公开发布还需签名、公证与 Gatekeeper 验证。

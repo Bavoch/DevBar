@@ -1,6 +1,6 @@
 # Contributing to DevBar
 
-DevBar is a distributable native macOS product for developers. Read
+DevBar is a distributable native macOS product for people building with AI. Read
 [product principles](docs/product-principles.md) and the
 [platform matrix](docs/platform-matrix.md) before adding adapters.
 
@@ -20,6 +20,12 @@ uses isolated state and fixtures without foreground browser windows. It does not
 require the maintainer's projects, installed DevBar, credentials, or devices.
 For a specific adapter, add the relevant acceptance scripts documented in
 [release checks](docs/release.md). Never run tests against personal host profiles.
+
+With Swift, Cargo, Go and Python installed, `python3 scripts/verify_project_flows.py`
+checks actual compilation, restart, outside-directory scripts, web readiness and
+Node environment selection. `python3 scripts/verify_target_runtime.py extension`
+uses an isolated headless Chromium profile. Its `ios` variant requires full Xcode,
+XcodeGen and a simulator runtime; it never opens the Simulator window.
 
 `DEVBAR_DATA_DIR` selects isolated app state. Runtime adapters must obtain real
 version evidence; do not infer successful updates from a running wrapper, expected

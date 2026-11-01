@@ -2,7 +2,10 @@
 
 DevBar inspects local processes and can run commands explicitly configured for a
 project. Treat project configuration as executable code: review it before running
-or enabling automatic updates, especially in an unfamiliar checkout.
+especially in an unfamiliar checkout. Discovery never grants permission to run a project.
+Runtime controls verify project ownership, process birth, user, executable and
+individual PIDs. Shared terminal/IDE process groups and AI tools are excluded.
+Discovery alone never sends signals; stopping or restarting requires an explicit action.
 
 Do not post credentials, signing material, full private logs, or a working exploit
 containing personal data in public issues. Once this project is hosted on GitHub,
