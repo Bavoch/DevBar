@@ -237,6 +237,13 @@ enum DesktopApplications {
         if let pid = target.pid, let app = NSRunningApplication(processIdentifier: pid_t(pid)), !app.isTerminated,
            app.executableURL?.path == target.executable, app.launchDate == target.launchedAt {
             app.unhide()
+            // Activation alone does not restore closed/hidden windows. Send
+            // the standard Dock-style reopen event to this exact instance.
+            let reopen = NSAppleEventDescriptor(eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEReopenApplication),
+                targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid_t(pid)),
+                returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+            do { _ = try reopen.sendEvent(options: [.noReply, .neverInteract], timeout: 2) }
+            catch { completion(failure("无法重新打开应用窗口：\(error.localizedDescription)")); return }
             if app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) { completion(nil) }
             else { completion(failure("无法唤起桌面应用")) }
             return

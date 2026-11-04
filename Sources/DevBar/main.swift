@@ -639,6 +639,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func wake() { refresh() }
+
+    @objc private func openOwnPanel() {
+        if panelWindow.isVisible { panelWindow.makeKeyAndOrderFront(nil) }
+        else { togglePanel() }
+    }
     func menuWillOpen(_ menu: NSMenu) { rebuild(); menuOpen = true; refresh() }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false; rebuild() }
 
@@ -723,8 +728,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let models: [PanelProject] = menu.items.compactMap { row in
             guard let path = row.representedObject as? String, let child = row.submenu else { return nil }
             let project = running[path]
-            let detail = messages[path] ?? operations[path] ?? project?.activityDetail
-                ?? (configs[path].flatMap { runs[$0.id]?.exitCode }.map { [0, 130, 143].contains($0) ? "已停止" : "运行失败 · 可重试" } ?? "已停止")
+            let failed = project?.freshness?.state == .failed
+                || presentation.targetPhases[path]?.values.contains(.failed) == true
+                || (project?.isRunning != true && configs[path].flatMap { runs[$0.id]?.exitCode }
+                    .map { ![0, 130, 143].contains($0) } == true)
+            let detail = messages[path] ?? operations[path]
+                ?? (failed ? "运行失败 · 可重试" : (project?.freshness?.state == .starting ? "启动中" : displayPath(path)))
             let options = NSMenu()
             if let copied = child.copy() as? NSMenu {
                 for entry in copied.items { copied.removeItem(entry); options.addItem(entry) }
@@ -733,7 +742,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 isRunning: project?.isRunning == true,
                 icon: projectImages[path] ?? fallbackIcon,
                 open: child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) },
-                control: child.items.first { $0.identifier?.rawValue == "control" }, more: options)
+                control: child.items.first { $0.identifier?.rawValue == "control" }, more: options,
+                operation: operations[path] ?? (project?.freshness?.state == .starting && project?.isRunning != true ? "启动中" : nil))
         }
         panel.update(models, running: projects.filter(\.isRunning).count, error: error, scanning: scanning)
     }
@@ -834,30 +844,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func makeProjectMenu(_ project: Project) -> NSMenu {
         let config = saved.first(where: { $0.path == project.path })
+        let expectsDesktop = config.flatMap { presentation.selected($0) }?.kind == .desktop
+        let ownsThisApp = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path.hasPrefix(project.path + "/")
         let child = NSMenu()
         note(displayPath(project.path), to: child)
         if let message = messages[project.path] { note(message, to: child) }
         child.addItem(.separator())
-        if let session = project.session {
+        if ownsThisApp {
+            add("打开应用", action: #selector(openOwnPanel), value: project.path, to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
+        } else if let session = project.session {
             let row = add(session.kind == .browserExtension ? "打开插件" : session.kind == .ios ? "打开模拟器" : "打开应用", action: #selector(openTargetSession(_:)), value: project.path, to: child)
             row.identifier = NSUserInterfaceItemIdentifier("entry-0")
         } else if let desktop = project.desktop, desktop.canOpen {
             let row = add("打开应用", action: #selector(openDesktop(_:)), value: project.path, to: child)
             row.identifier = NSUserInterfaceItemIdentifier("entry-0")
             row.isEnabled = desktop.canOpen
-        } else if project.entryPoints.count > 1 {
+        } else if !expectsDesktop, project.entryPoints.count > 1 {
             let addresses = NSMenu()
             for listener in project.entryPoints {
                 add("localhost:\(listener.port)", action: #selector(openURL(_:)), value: webpageURL(listener, config: config), to: addresses)
             }
             addSubmenu("打开网页", child: addresses, to: child)
             child.items.last?.identifier = NSUserInterfaceItemIdentifier("entry-0")
-        } else if let listener = project.entryPoints.first {
+        } else if !expectsDesktop, let listener = project.entryPoints.first {
             add("打开网页", action: #selector(openURL(_:)), value: webpageURL(listener, config: config), to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
         let managed = !(presentation.activeTargets[project.path] ?? []).isEmpty
         if project.freshness?.state == .starting, !project.isRunning, operations[project.path] == nil {
-            note("启动中…", to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
+            note("启动中", to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
         if let operation = operations[project.path] {
             note(operation, to: child).identifier = NSUserInterfaceItemIdentifier("control")
@@ -1032,6 +1046,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         precondition(takeReadyOpen(path: first.path) == nil, "Auto-open once per launch")
         pendingOpens[first.path] = PendingOpen(token: run.token, kind: .desktop, deadline: Date().addingTimeInterval(180))
         precondition(takeReadyOpen(path: first.path) == nil, "Desktop launches must not open their development server")
+        projects[0].desktop = DesktopTarget(runtime: "Electron", pid: 101)
+        precondition(takeReadyOpen(path: first.path)?.action == #selector(openDesktop(_:)),
+                     "Desktop readiness must immediately select the application window")
+        precondition(takeReadyOpen(path: first.path) == nil, "Open a desktop window only once per launch")
+        projects[0].desktop = nil
+        pendingOpens[first.path] = PendingOpen(token: run.token, kind: .service, deadline: .distantFuture)
+        awaitReadyOpen(path: first.path, token: run.token)
+        precondition(pendingOpens[first.path] == nil, "Background services must not poll for or open a browser window")
         pendingOpens[first.path] = PendingOpen(token: "previous-launch", kind: .web, deadline: Date().addingTimeInterval(180))
         precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] == nil, "Ignore superseded launches")
         pendingOpens[first.path] = PendingOpen(token: run.token, kind: .web, deadline: .distantPast)
@@ -1041,6 +1063,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         precondition(takeReadyOpen(path: first.path) == nil && pendingOpens[first.path] == nil, "Do not open failed launches")
         print("PASS: automatic opening waits for readiness, opens once, ignores failed/expired/superseded starts and desktop dev servers; no windows opened")
         print("PASS: standard NSMenu action routing without custom menu views or attributed styling; project submenus retained")
+        let desktopTarget = LaunchTarget(id: "dev", title: "桌面端", kind: .desktop, directory: first.path, command: first.command)
+        presentation.profiles[first.path] = ProjectProfile(path: first.path, targets: [desktopTarget], notes: [])
+        precondition(!makeProjectMenu(projects[0]).items.contains { $0.action == #selector(openURL(_:)) },
+                     "A selected desktop target must not silently open its renderer in a browser")
+        let ownPath = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
+        let own = Project(path: ownPath, name: "DevBar", listeners: [], processes: [], entryPoints: [], auxiliaryServices: [])
+        precondition(makeProjectMenu(own).items.contains { $0.action == #selector(openOwnPanel) })
+        print("PASS: selected desktop entries never fall back to browser renderers; DevBar opens its own panel")
     }
 
     func verifyMenuRefresh() {
@@ -1208,7 +1238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if NSWorkspace.shared.open(store.logURL(id)) { noteActivity(project.path); rebuild() }
     }
 
-    private func perform(path: String, message: String, reportFailure: Bool = false, work: @escaping () throws -> Void) {
+    private func perform(path: String, message: String, opensWhenReady: Bool = false, reportFailure: Bool = false, work: @escaping () throws -> Void) {
         guard operations[path] == nil else { return }
         let store = self.store
         operations[path] = message
@@ -1234,9 +1264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if case .success(let (_, configs, state)) = result {
                     self.saved = configs; self.presentation = state; self.runs = state.runs
                 }
-                if message == "启动中…", case .success(let (activeRuns, _, state)) = result,
+                if opensWhenReady, case .success(let (activeRuns, _, state)) = result,
                    let config = self.saved.first(where: { $0.path == path }),
-                   let run = activeRuns.max(by: { $0.startedAt < $1.startedAt }) {
+                   let run = activeRuns.first(where: { $0.targetID == state.selected(config)?.id })
+                    ?? activeRuns.max(by: { $0.startedAt < $1.startedAt }) {
                     self.launchDeadlines[path] = Date().addingTimeInterval(30)
                     self.pendingOpens[path] = PendingOpen(token: run.token, kind: state.selected(config)?.kind,
                         deadline: Date().addingTimeInterval(180))
@@ -1245,6 +1276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.presentation.activeTargets[path] = Set(activeRuns.compactMap(\.targetID))
                     self.presentation.selectedTargets[path] = run.targetID
                     self.presentation.logs.insert(config.id)
+                    self.awaitReadyOpen(path: path, token: run.token)
                     let phase = run.targetID.flatMap { state.targetPhases[path]?[$0] }
                     let freshness = RuntimeFreshness(state: phase == .failed ? .failed : .starting, reason: "正在确认运行状态")
                     if let index = self.projects.firstIndex(where: { $0.path == path }) {
@@ -1262,6 +1294,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.rebuild()
                 self.refresh()
+            }
+        }
+    }
+
+    /// Explicit launches watch their own readiness independently of the full
+    /// project-list refresh, so unrelated slow services cannot delay opening.
+    private func awaitReadyOpen(path: String, token: String) {
+        guard let request = pendingOpens[path], request.token == token else { return }
+        if [.service, .script, .tool].contains(request.kind) {
+            pendingOpens[path] = nil
+            return
+        }
+        guard request.deadline > Date() else { pendingOpens[path] = nil; return }
+        let store = self.store
+        DispatchQueue.global(qos: .userInitiated).async {
+            let project = try? Discovery.scan(knownPaths: [path], onlyPaths: [path]).first { $0.path == path }
+            let configs = (try? store.load()) ?? []
+            let table = (try? ProcessTable.read()) ?? [:]
+            let state = ProjectPresentation.read(saved: configs.filter { $0.path == path }, store: store, table: table)
+            DispatchQueue.main.async {
+                guard self.pendingOpens[path]?.token == token, self.operations[path] == nil else { return }
+                if let config = self.saved.first(where: { $0.path == path }), let run = state.runs[config.id], run.token == token {
+                    self.runs[config.id] = run
+                    self.presentation.activeTargets[path] = state.activeTargets[path]
+                    self.presentation.targetPhases[path] = state.targetPhases[path]
+                }
+                if let project {
+                    if let index = self.projects.firstIndex(where: { $0.path == path }) { self.projects[index] = project }
+                    else { self.projects.append(project) }
+                }
+                if let entry = self.takeReadyOpen(path: path), let action = entry.action {
+                    NSApp.sendAction(action, to: self, from: entry)
+                    return
+                }
+                guard self.pendingOpens[path]?.token == token else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self.awaitReadyOpen(path: path, token: token)
+                }
             }
         }
     }
@@ -1346,7 +1416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             config.targetID = target.id; config.command = target.command
             let store = self.store
-            perform(path: config.path, message: "启动中…") {
+            perform(path: config.path, message: "启动中", opensWhenReady: true) {
                 try store.save(config)
                 try ProjectRunner.start(config, store: store)
             }
@@ -1367,20 +1437,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func startProject(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let config = saved.first(where: { $0.id == id }) else { return }
         let store = self.store
-        perform(path: config.path, message: "启动中…") { try ProjectRunner.start(config, store: store) }
+        perform(path: config.path, message: "启动中", opensWhenReady: true) { try ProjectRunner.start(config, store: store) }
     }
 
     @objc private func restartProject(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let config = saved.first(where: { $0.id == id }) else { return }
         let store = self.store
         let observed = projects.first { $0.path == config.path }
-        perform(path: config.path, message: "启动中…") { try ProjectRunner.restartProject(config, store: store, observed: observed) }
+        perform(path: config.path, message: "启动中", opensWhenReady: true) { try ProjectRunner.restartProject(config, store: store, observed: observed) }
     }
 
     @objc private func restartObservedProject(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String, let observed = projects.first(where: { $0.path == path }) else { return }
         let store = self.store
-        perform(path: path, message: "启动中…") {
+        perform(path: path, message: "启动中", opensWhenReady: true) {
             let existing = try store.load().first { $0.path == path }
             let config = existing ?? SavedProject(name: observed.name, path: path, command: "")
             if existing == nil { try store.save(config) }

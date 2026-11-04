@@ -10,6 +10,7 @@ struct PanelProject {
     let open: NSMenuItem?
     let control: NSMenuItem?
     let more: NSMenu
+    var operation: String? = nil
 }
 
 @MainActor
@@ -53,6 +54,11 @@ private final class PanelButtonLabel: NSStackView {
 private final class PanelButton: NSButton {
     var handler: ((NSButton) -> Void)?
     private var drawsActionSurface = false
+    // Custom surfaces occupy the full constrained frame, without the native
+    // button cell's bezel/alignment padding (which varies with its symbol).
+    override var alignmentRectInsets: NSEdgeInsets {
+        drawsActionSurface ? NSEdgeInsetsZero : super.alignmentRectInsets
+    }
     override var needsPanelToBecomeKey: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -90,15 +96,26 @@ private final class PanelButton: NSButton {
         return self
     }
 
-    func setActionLabel(symbol: String) {
+    func setActionLabel(symbol: String, loading: Bool = false) {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 13)
-        label.textColor = isEnabled ? .labelColor : .disabledControlTextColor
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        icon.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
-        icon.contentTintColor = label.textColor
-        icon.imageScaling = .scaleProportionallyUpOrDown
+        label.textColor = isEnabled || loading ? .labelColor : .disabledControlTextColor
+        let icon: NSView
+        if loading && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let progress = NSProgressIndicator()
+            progress.style = .spinning
+            progress.controlSize = .small
+            progress.isIndeterminate = true
+            progress.startAnimation(nil)
+            icon = progress
+        } else {
+            let image = NSImageView()
+            image.image = NSImage(systemSymbolName: loading ? "hourglass" : symbol, accessibilityDescription: nil)
+            image.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+            image.contentTintColor = label.textColor
+            image.imageScaling = .scaleProportionallyUpOrDown
+            icon = image
+        }
         let content = PanelButtonLabel(views: [icon, label])
         content.orientation = .horizontal
         content.alignment = .centerY
@@ -109,8 +126,8 @@ private final class PanelButton: NSButton {
         addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 10),
-            icon.heightAnchor.constraint(equalToConstant: 10),
+            icon.widthAnchor.constraint(equalToConstant: loading ? 12 : 10),
+            icon.heightAnchor.constraint(equalToConstant: loading ? 12 : 10),
             content.centerXAnchor.constraint(equalTo: centerXAnchor),
             content.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -128,7 +145,15 @@ private final class PanelButton: NSButton {
                 level = isHighlighted && isEnabled ? 0.78 : (highContrast ? 0.82 : 0.90)
             }
             NSColor(white: level, alpha: 1).setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 16, yRadius: 16).fill()
+            if imagePosition == .imageOnly {
+                let diameter = min(bounds.width, bounds.height)
+                let circle = NSRect(x: bounds.midX - diameter / 2, y: bounds.midY - diameter / 2,
+                                    width: diameter, height: diameter)
+                NSBezierPath(ovalIn: circle).fill()
+            } else {
+                let radius = min(bounds.width, bounds.height) / 2
+                NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
+            }
         }
         super.draw(dirtyRect)
     }
@@ -150,6 +175,7 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private let emptyIcon = NSImageView()
     private let emptyHint = NSTextField(wrappingLabelWithString: "点右上角 ＋ 添加本地项目")
     private var models: [PanelProject] = []
+    private var pendingStarts: Set<String> = []
     private(set) var visible: [PanelProject] = []
     var onAdd: (() -> Void)?
     var onRefresh: (() -> Void)?
@@ -269,6 +295,11 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     func update(_ models: [PanelProject], running: Int, error: String?, scanning: Bool) {
+        pendingStarts.formUnion(models.filter { !$0.isRunning && $0.operation == "启动中" }.map(\.path))
+        if models.contains(where: { $0.isRunning && pendingStarts.contains($0.path) }) {
+            tabs.selectedSegment = 0
+        }
+        pendingStarts = pendingStarts.intersection(models.filter { !$0.isRunning && $0.operation == "启动中" }.map(\.path))
         self.models = models
         let runningCount = models.filter(\.isRunning).count
         tabs.setLabel("运行中 (\(runningCount))", forSegment: 0)
@@ -356,8 +387,8 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let detail = NSTextField(labelWithString: model.detail)
         detail.font = .systemFont(ofSize: 12)
         detail.textColor = .secondaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
-        detail.toolTip = model.detail
+        detail.lineBreakMode = .byTruncatingHead
+        detail.toolTip = model.detail.hasPrefix("/") || model.detail.hasPrefix("~/") ? model.path : model.detail
         detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         // Unavailable opening is an action state, not a disabled project title.
         let titleLabel = NSTextField(labelWithString: model.name)
@@ -382,10 +413,11 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         }
         var views: [NSView] = [icon, labels]
         if let action = model.control {
-            let button = PanelButton(title: action.title) { sender in Self.perform(action, anchor: sender) }
+            let loading = model.operation != nil
+            let button = PanelButton(title: model.operation ?? action.title) { sender in Self.perform(action, anchor: sender) }
             button.widthAnchor.constraint(equalToConstant: 76).isActive = true
-            button.isEnabled = action.isEnabled && action.action != nil
-            button.setActionLabel(symbol: model.isRunning ? "stop.fill" : "play.fill")
+            button.isEnabled = !loading && action.isEnabled && action.action != nil
+            button.setActionLabel(symbol: model.isRunning ? "stop.fill" : "play.fill", loading: loading)
             views.append(button.actionSurface())
         }
         views.append(more.actionSurface())
@@ -423,6 +455,29 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         precondition(view.visible.map(\.path) == ["/api"])
         view.tabs.selectedSegment = 1; view.tabChanged()
         precondition(view.visible.map(\.path) == ["/web"])
+        var starting = models[0]
+        starting.operation = "启动中"
+        view.update([starting, models[1]], running: 1, error: nil, scanning: false)
+        precondition(view.tabs.selectedSegment == 1 && view.visible.first?.operation == "启动中")
+        let startingCell = view.tableView(view.table, viewFor: nil, row: 0)!
+        let actions = (startingCell.subviews[0] as! NSStackView).arrangedSubviews
+        let loadingButton = actions[2] as! PanelButton
+        precondition(!loadingButton.isEnabled && loadingButton.accessibilityLabel() == "启动中")
+        let loadingIcon = (loadingButton.subviews[0] as! NSStackView).arrangedSubviews[0]
+        precondition(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                     ? loadingIcon is NSImageView : loadingIcon is NSProgressIndicator)
+        let started = PanelProject(path: "/web", name: "Web", detail: "localhost:5173", isRunning: true,
+                                   icon: nil, open: nil, control: control, more: menu)
+        view.update([started, models[1]], running: 2, error: nil, scanning: false)
+        precondition(view.tabs.selectedSegment == 0 && view.visible.map(\.path) == ["/web", "/api"],
+                     "A completed explicit launch must reveal the running projects")
+        view.tabs.selectedSegment = 1; view.tabChanged()
+        view.update([started, models[1]], running: 2, error: nil, scanning: false)
+        precondition(view.tabs.selectedSegment == 1, "Later scans must preserve the selected tab")
+        view.update([starting, models[1]], running: 1, error: nil, scanning: false)
+        view.update(models, running: 1, error: nil, scanning: false)
+        precondition(view.tabs.selectedSegment == 1 && view.pendingStarts.isEmpty,
+                     "Failed launches must stay in the stopped tab and clear the pending transition")
         view.search.stringValue = "WEB"; view.filter()
         precondition(view.visible.map(\.path) == ["/web"] && view.tabs.isHidden)
         view.tabs.selectedSegment = 0; view.tabChanged()
