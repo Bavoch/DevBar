@@ -52,7 +52,12 @@ enum LaunchIsolation {
         "$@"
         exit $?
         """
-        var inherited = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        var inherited = ProcessInfo.processInfo.environment
+        // Electron-based launchers can run DevBar in Node mode. That mode belongs
+        // to the launcher, not the project's Electron app. Explicit task settings
+        // (or assignments in the project command) can still opt into Node mode.
+        inherited.removeValue(forKey: "ELECTRON_RUN_AS_NODE")
+        inherited.merge(environment) { _, new in new }
         // A managed command must not advertise the manager's bundle identity.
         inherited.removeValue(forKey: "__CFBundleIdentifier")
         inherited.removeValue(forKey: "XPC_SERVICE_NAME")
