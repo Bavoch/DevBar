@@ -112,6 +112,16 @@ enum Discovery {
         let text = launchText(command).lowercased()
         let name = URL(fileURLWithPath: executable).lastPathComponent
         let runtime = name.lowercased()
+        let languageServers: Set<String> = ["rust-analyzer", "typescript-language-server", "pyright", "pyright-langserver",
+                                            "basedpyright-langserver", "pylance", "jdtls", "sourcekit-lsp", "gopls", "clangd", "vscode-json-languageserver"]
+        if languageServers.contains(runtime) { return (.tool, "语言服务") }
+        if runtime.contains("crashpad_handler") || runtime.hasPrefix("electron helper")
+            || executable.contains("/Electron Framework.framework/Helpers/") {
+            return (.helper, "应用辅助进程")
+        }
+        if runtime == "electron", text.range(of: #"(?:^|\s)--type=(?:renderer|gpu-process|utility|zygote)(?=\s|$)"#, options: .regularExpression) != nil {
+            return (.helper, "应用辅助进程")
+        }
         if ["codex", "kilo"].contains(runtime) { return (.tool, runtime == "codex" ? "Codex" : "Kilo") }
         let agents = [("/cli/bin/codebuddy", "WorkBuddy"), ("/bin/codebuddy", "WorkBuddy"),
                       ("@oh-my-pi/pi-coding-agent/", "OMP"), ("/.bun/bin/omp", "OMP"),
@@ -125,10 +135,16 @@ enum Discovery {
                      ("/mcp-server", "MCP 工具"), ("typescript-language-server", "语言服务"),
                      ("/tsserver.js", "语言服务"), ("/pyright", "语言服务"), ("/pylance", "语言服务"),
                      ("/jdtls", "语言服务"), ("/rust-analyzer", "语言服务")]
-        let canBeTool = ["node", "bun", "bun.exe", "python", "python3", "uv", "uvx", "npx", "npm"].contains(runtime)
+        let canBeTool = ["node", "bun", "bun.exe", "deno", "python", "python3", "uv", "uvx", "npx", "npm", "pnpm", "yarn", "electron"].contains(runtime)
             || runtime.hasPrefix("python3.") || runtime.contains("mcp") || executable.contains("/cua_node/")
         if canBeTool {
             for (marker, label) in tools where text.contains(marker) { return (.tool, label) }
+            // Repository-local MCP entry points are tools too. Their working
+            // directory and source path must not make a closed app look alive
+            // or make its AI integrations eligible for the Stop action.
+            if text.range(of: #"(?:^|[\s/])(?:mcp|mcp[-_]server|server[-_]mcp)\.(?:[cm]?js|[cm]?ts|py)(?=[\s\"']|$)"#, options: .regularExpression) != nil {
+                return (.tool, "MCP 工具")
+            }
         }
         if name.lowercased().contains("esbuild") { return (.helper, "构建工具") }
         let services = [(#"(?:^|[\s/])vite(?:\.[cm]?js)?(?=[\s\"']|$)"#, "Vite"),
@@ -1831,6 +1847,21 @@ if cliArguments.count == 2 && ["--version", "version"].contains(cliArguments[1])
     precondition(Discovery.projectRoot("/opt/homebrew/bin/postgres") == nil)
     precondition(Discovery.projectRoot("/var/folders/example/T/runtime") == nil)
     precondition(Discovery.classify("node /tmp/agentation-mcp/index.js", executable: "node").0 == .tool)
+    precondition(Discovery.classify("node /project/node_modules/tsx/dist/cli.mjs /project/server/mcp.ts", executable: "node").0 == .tool)
+    precondition(Discovery.classify("node --require /project/preflight.cjs --import file:///project/loader.mjs /project/server/mcp.ts", executable: "node").0 == .tool)
+    precondition(Discovery.classify("node /project/mcp-dashboard/server.js", executable: "node").0 == .project)
+    precondition(Discovery.classify("node /project/server/mcp.ts.backup.js", executable: "node").0 == .project)
+    precondition(Discovery.classify("python3 /project/tools/mcp_server.py", executable: "/usr/bin/python3").0 == .tool)
+    precondition(Discovery.classify("deno run /project/mcp-server.ts", executable: "deno").0 == .tool)
+    precondition(Discovery.classify("python3 /project/server_mcp.py", executable: "python3").0 == .tool)
+    precondition(Discovery.classify("python3 /project/mcp_client.py", executable: "python3").0 == .project)
+    for name in ["rust-analyzer", "sourcekit-lsp", "gopls", "clangd", "basedpyright-langserver"] {
+        precondition(Discovery.classify("/project/bin/" + name, executable: "/project/bin/" + name).0 == .tool)
+    }
+    precondition(Discovery.classify("/project/Electron --type=gpu-process", executable: "/project/Electron").0 == .helper)
+    precondition(Discovery.classify("/project/Electron .", executable: "/project/Electron").0 == .project)
+    precondition(Discovery.classify("/project/Electron Helper (Renderer) --type=renderer", executable: "/project/Electron Helper (Renderer)").0 == .helper)
+    precondition(Discovery.classify("/project/chrome_crashpad_handler --monitor-self", executable: "/project/chrome_crashpad_handler").0 == .helper)
     precondition(Discovery.classify("zsh -c 'node agentation-mcp'", executable: "/bin/zsh").0 == .project)
     precondition(Discovery.classify("node /Users/test/Documents/Codex/app/server.js", executable: "node").0 == .project)
     precondition(Discovery.classify("node /app/node_modules/.bin/vite", executable: "node").1 == "Vite")

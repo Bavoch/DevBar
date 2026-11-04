@@ -82,6 +82,9 @@ enum EntryPointSelector {
                 results.append(PortAssessment(listener: endpoint, role: role, reason: reason))
             }
             guard process.category == .project else { add(.tool, "辅助进程"); continue }
+            if command.range(of: #"(?:^|[\s/])hermes\s+serve(?=\s|$)"#, options: .regularExpression) != nil {
+                add(.api, "Hermes 无网页界面的后端服务"); continue
+            }
             if process.label == "插件会话" { add(.debug, "插件测试浏览器的内部调试监听"); continue }
             if debugPorts(command).contains(listener.port) { add(.debug, "进程声明的调试端口"); continue }
             var owner: (pid: Int, family: Family)?
@@ -163,6 +166,14 @@ enum EntryPointSelector {
         }
         func listener(_ pid: Int, _ port: Int) -> Listener { Listener(pid: pid, port: port, process: "node") }
         precondition(declaredPorts("next dev --port=3004") == [3004])
+        let hermes = [process(91, "python3", "python3")]
+        let backend = assess(listeners: [listener(91, 50530)], processes: hermes,
+            commands: [91: "python3 /tools/bin/hermes serve --host 127.0.0.1 --port 0"], parents: [:],
+            probe: { _ in HTTPObservation(kind: .page) })
+        precondition(backend.first?.role == .api, "Headless backend HTML notices must not become webpage entries")
+        precondition(assess(listeners: [listener(91, 50530)], processes: hermes,
+            commands: [91: "python3 /tools/bin/hermes dashboard"], parents: [:],
+            probe: { _ in HTTPObservation(kind: .page) }).first?.role == .webpage)
         precondition(declaredPorts("next dev -p3004 --inspect-port=9229") == [3004])
         let next = [process(101, "node", "Next.js"), process(102, "next-server", "next-server"), process(103, "workerd", "Workers")]
         let ports = [listener(101, 64557), listener(102, 3004), listener(102, 64572), listener(103, 64558), listener(103, 64559)]

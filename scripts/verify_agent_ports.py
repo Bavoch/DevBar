@@ -8,7 +8,7 @@ import tempfile
 import time
 
 root=Path(__file__).resolve().parents[1]
-binary=str(root/'.build/release/DevBar')
+binary=os.environ.get('DEVBAR_TEST_BINARY', str(root/'.build/release/DevBar'))
 with tempfile.TemporaryDirectory(prefix='Agent ports ',dir=root/'work') as folder:
     base=Path(folder)
     project=base/'Project'
