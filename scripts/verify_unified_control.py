@@ -39,7 +39,17 @@ with tempfile.TemporaryDirectory(prefix='Unified control ', dir=ROOT / 'work') a
     env = dict(os.environ, DEVBAR_DATA_DIR=str(state), DEVBAR_HEADLESS='1')
     main_port, tool_port, other_port, helper_port = port(), port(), port(), port()
     source = f'import http.server\nhttp.server.HTTPServer.allow_reuse_address=True\nhttp.server.HTTPServer(("127.0.0.1",{main_port}),http.server.SimpleHTTPRequestHandler).serve_forever()\n'
-    (project / 'server.py').write_text(source)
+    exit_request = project / 'exit-request'
+    managed_source = (
+        'from pathlib import Path\nimport http.server\n'
+        'http.server.HTTPServer.allow_reuse_address=True\n'
+        f'with http.server.HTTPServer(("127.0.0.1",{main_port}),http.server.SimpleHTTPRequestHandler) as server:\n'
+        '    server.timeout = 0.1\n'
+        '    while not Path("exit-request").exists():\n'
+        '        server.handle_request()\n'
+        'raise SystemExit(17)\n'
+    )
+    (project / 'server.py').write_text(managed_source)
     (project / 'agentation-mcp.py').write_text(source.replace(str(main_port), str(tool_port)))
     (project / 'package.json').write_text(json.dumps({'scripts': {'dev': shlex.quote(sys.executable) + ' server.py'}}))
     (other / 'package.json').write_text('{}')
@@ -84,9 +94,10 @@ with tempfile.TemporaryDirectory(prefix='Unified control ', dir=ROOT / 'work') a
         (project/'external.py').write_text(source)
         cli('--start-project', identifier)
         wait(lambda: ready(main_port))
-        (project/'server.py').write_text('syntax error !')
+        exit_request.touch()
         wait(lambda: not ready(main_port) and any(json.loads(file.read_text()).get('phase') == 'failed'
              for file in (state/'development').glob('*.json')))
+        exit_request.unlink()
         mixed_runtime = subprocess.Popen([sys.executable, 'external.py'], cwd=project,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         wait(lambda: ready(main_port))
@@ -97,7 +108,6 @@ with tempfile.TemporaryDirectory(prefix='Unified control ', dir=ROOT / 'work') a
         wait(lambda: not ready(main_port))
         mixed_runtime.wait(timeout=5)
         assert ready(tool_port) and ready(helper_port) and ready(other_port)
-        (project/'server.py').write_text(source)
         (project/'external.py').unlink()
         print('PASS: failed supervision does not hide a healthy runtime; one project Stop handles all confirmed instances')
 

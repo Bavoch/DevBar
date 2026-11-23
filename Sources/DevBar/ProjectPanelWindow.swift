@@ -31,27 +31,32 @@ final class ProjectPanelWindow: NSPanel {
         host.layer?.cornerRadius = Self.cornerRadius
         host.layer?.masksToBounds = true
         host.focusRingType = .none
-        let backdrop: NSView
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: host.bounds)
-            glass.cornerRadius = Self.cornerRadius
-            glass.style = .regular
-            glass.contentView = content
-            backdrop = glass
-        } else {
-            let material = NSVisualEffectView(frame: host.bounds)
-            material.material = .popover
-            material.blendingMode = .behindWindow
-            material.state = .active
-            content.frame = material.bounds
-            content.autoresizingMask = [.width, .height]
-            material.addSubview(content)
-            backdrop = material
-        }
+        let backdrop = makeBackdrop(for: content)
+        backdrop.frame = host.bounds
         backdrop.autoresizingMask = [.width, .height]
         host.addSubview(backdrop)
         contentView = host
         initialFirstResponder = content
+    }
+
+    private func makeBackdrop(for content: NSView) -> NSView {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: content.bounds)
+            glass.cornerRadius = Self.cornerRadius
+            glass.style = .regular
+            glass.contentView = content
+            return glass
+        }
+        #endif
+        let material = NSVisualEffectView(frame: content.bounds)
+        material.material = .popover
+        material.blendingMode = .behindWindow
+        material.state = .active
+        content.frame = material.bounds
+        content.autoresizingMask = [.width, .height]
+        material.addSubview(content)
+        return material
     }
     func show(below view: NSView) {
         anchor = view

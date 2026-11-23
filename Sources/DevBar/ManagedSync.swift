@@ -147,8 +147,12 @@ enum ManagedSync {
         if selected.strategy == "process" {
             let recorded = DevelopmentRuntime.state(root, target: key, exact: true) != nil
             guard recorded || config.targets.count == 1 else { throw failure("暂时无法确认该运行方式的进程，请使用项目的停止操作") }
-            let outcome = try ProjectRunner.stop(path: root, store: ProjectStore(), targetID: recorded ? key : nil).outcome
+            // A failed receipt can outlive its process while the project's
+            // single entry point has since been started from a terminal.
+            let outcome = try ProjectRunner.stop(path: root, store: ProjectStore(), targetID: recorded ? key : nil,
+                                                 observeUnmanaged: config.targets.count == 1).outcome
             if case .stillRunning = outcome { throw failure("项目尚未停止，请稍后重试") }
+            if case .forceStopped(let remaining) = outcome, !remaining.isEmpty { throw failure("项目尚未停止，请稍后重试") }
             return try SyncRouter.encode(ManagedReport(state: "stopped", reason: "已停止开发会话", plan: try? plan(path: root, target: key)), state: "ready")
         }
         guard selected.strategy != nil, selected.strategy != "macBundle" else { throw failure("应用包目标请使用 DevBar 的应用启停操作；stop 命令当前用于受管运行会话") }

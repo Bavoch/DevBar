@@ -314,11 +314,13 @@ enum ProjectRunner {
     /// The control action must verify identities; a shared directory or process
     /// group never grants permission to stop a terminal or unrelated service.
     @discardableResult
-    static func stop(path: String, store: ProjectStore, targetID: String? = nil, grace: TimeInterval = gracefulGrace) throws -> (outcome: StopOutcome, discovered: Project?) {
+    static func stop(path: String, store: ProjectStore, targetID: String? = nil, grace: TimeInterval = gracefulGrace,
+                     observeUnmanaged: Bool = false) throws -> (outcome: StopOutcome, discovered: Project?) {
         let saved = try store.load()
         let table = try ProcessTable.read()
         let hasActive = saved.first(where: { $0.path == path }).map { config in store.runs(config.id).contains { active($0, path: path, table: table) } } ?? false
-        let observed = targetID == nil && !hasActive ? try Discovery.scan(knownPaths: [path], light: true, onlyPaths: [path]).first { $0.path == path } : nil
+        let observed = (targetID == nil || observeUnmanaged) && !hasActive
+            ? try Discovery.scan(knownPaths: [path], light: true, onlyPaths: [path]).first { $0.path == path } : nil
         let result = try store.locked { try stopLocked(path: path, store: store, targetID: targetID, grace: grace, observed: observed) }
         try? store.recordActivity(path: path)
         return result
@@ -366,7 +368,7 @@ enum ProjectRunner {
         }
         if let native, let live = table[native.pid] { targets[native.pid] = live }
         if targets.isEmpty {
-            if targetID != nil, records.contains(where: { ProcessTable.active($0, table: table) }) { return (.stopped, nil) }
+            if targetID != nil, !activeRecords.isEmpty { return (.stopped, nil) }
             if let observed {
                 guard !observed.controlProcesses.isEmpty else { throw failure("暂时无法确认运行进程，请刷新后重试") }
                 return (try stopObserved(observed, grace: grace), observed)

@@ -12,10 +12,12 @@ cp -R .build/release/DevBar_DevBar.bundle "$stage/Contents/Resources/"
 cp scripts/devbar scripts/install-cli.sh "$stage/Contents/Resources/"
 cp -R drivers "$stage/Contents/Resources/drivers"
 find "$stage/Contents/Resources/drivers" -type d -name __pycache__ -prune -exec rm -rf {} +
-cp -R docs "$stage/Contents/Resources/docs"
-for document in README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE; do
-  if [[ -f "$document" ]]; then cp "$document" "$stage/Contents/Resources/"; fi
-done
+mkdir "$stage/Contents/Resources/docs"
+cp docs/{launch-permissions,open-source-readiness,platform-matrix,product-principles,production-review,release,sync-contract}.md docs/sync.schema.json "$stage/Contents/Resources/docs/"
+mkdir -p "$stage/Contents/Resources/website/assets"
+cp website/assets/devbar-panel.png "$stage/Contents/Resources/website/assets/"
+cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE "$stage/Contents/Resources/"
+sips -s format icns icon.png --out "$stage/Contents/Resources/DevBar.icns" >/dev/null
 chmod +x "$stage/Contents/Resources/devbar" "$stage/Contents/Resources/install-cli.sh"
 cat > "$stage/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,6 +26,7 @@ cat > "$stage/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>DevBar</string>
 <key>CFBundleIdentifier</key><string>local.devbar.app</string>
 <key>CFBundleName</key><string>DevBar</string>
+<key>CFBundleIconFile</key><string>DevBar.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>0.16.0</string>
 <key>CFBundleVersion</key><string>33</string>

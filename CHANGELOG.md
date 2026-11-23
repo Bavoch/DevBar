@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.16.0 — Unreleased
+## 0.16.0 — 2026-11-23
+
+首个公开源码版本，使用 MIT 许可证。提供 macOS 源码构建、产品官网及 GitHub 反馈渠道。
 
 - 列表滚动条改为 overlay 悬浮式并弱化（贴面板右缘、半透明），不再占据内容空间；列表内容内边距保持不变。
 - 面板行状态文字从「运行中」改为显示实际运行端口（如 localhost:5173，多入口标注数量）；桌面应用、模拟器等非端口目标显示对应运行方式，停止的项目没有运行端口、保持「已停止」。
@@ -15,9 +17,10 @@
 - 自动接入统一使用本地运行入口，删除自动推断安装替换和维护者目录扫描。
 - 拒绝自动选择发布、部署、脱离管理、构建预览及危险生命周期脚本；诊断与实际运行校验保持一致。
 - 项目列表校验重复项和非法路径，损坏配置保留原文件；运行中不能移除管理记录。
-- 刷新产品说明与隔离回归；公开分发仍需正式签名、公证、许可与平台验收。
+- 补齐浏览器扩展、Web Manifest 和仓库内子项目的本地图标识别。
+- 安装包携带 DevBar 应用图标与许可证。
 
-## 0.15.0 — Unreleased
+## 0.15.0 — 本地开发版本
 
 统一运行模型重构（破坏性变更，协议 v2）：
 
@@ -29,7 +32,7 @@
 - **文档**：sync-contract 升级 v2；schema 中 runtimeWitness 标记 deprecated。
 
 
-## 0.14.1 — Unreleased
+## 0.14.1 — 本地开发版本
 
 - Add an application-update setup entry that remains available when configuration
   is missing or invalid, and allow automatic updates to be disabled in that state.

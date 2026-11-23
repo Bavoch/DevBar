@@ -521,7 +521,8 @@ final class ProjectPanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         NSApp.setActivationPolicy(.accessory)
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
         let foregroundOnOpen = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        window.show(below: NSView())
+        let offscreenAnchor = NSView()
+        window.show(below: offscreenAnchor)
         precondition(window.isKeyWindow && window.firstResponder === view,
                      "Opening the panel must establish active appearance without starting search editing")
         precondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == foregroundOnOpen,

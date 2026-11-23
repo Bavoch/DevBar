@@ -10,12 +10,15 @@ concurrency:
   cancel-in-progress: true
 jobs:
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Build self-contained development app
         run: zsh scripts/build.sh
       - name: Check product without foreground windows

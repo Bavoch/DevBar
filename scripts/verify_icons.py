@@ -57,9 +57,39 @@ with tempfile.TemporaryDirectory(prefix='Icons ', dir=root / 'work') as folder:
     assert row['hasIcon'] and row['iconIsTemplate'] is True, 'Missing icon must retain a consistent template fallback'
     print('PASS: declared icons, SVG/PNG rendering, Tauri icons, corrupt/missing fallback, local path boundaries and native menu consumption')
 
+with tempfile.TemporaryDirectory(prefix='Nested icons ', dir=root / 'work') as folder:
+    project = pathlib.Path(folder)
+    (project / 'icons').mkdir()
+    (project / 'icons/tiny.png').write_bytes(png())
+    (project / 'icons/store.png').write_bytes(png())
+    manifest = project / 'manifest.json'
+    manifest.write_text(json.dumps({'manifest_version': 3, 'icons': {
+        '16': 'icons/tiny.png', '128': 'icons/store.png', '256': 'icons/missing.png'
+    }}))
+    assert icon(project)['source'].endswith('/icons/store.png'), 'Prefer the largest usable declared extension icon'
+    manifest.write_text(json.dumps({'manifest_version': 3, 'action': {'default_icon': 'icons/tiny.png'}}))
+    assert icon(project)['source'].endswith('/icons/tiny.png')
+    manifest.unlink()
+
+    web = project / 'web'
+    (web / 'public/brand').mkdir(parents=True)
+    (web / 'index.html').write_text('<link rel="manifest" href="/brand/site.webmanifest">')
+    (web / 'public/brand/site.webmanifest').write_text(json.dumps({'icons': [{'src': 'project.png'}]}))
+    (web / 'public/brand/project.png').write_bytes(png())
+    assert icon(project)['source'].endswith('/web/public/brand/project.png'), 'Web URLs resolve from the child application'
+
+    (project / '.git').mkdir()
+    (project / 'icon.png').write_bytes(png())
+    child = project / 'native'
+    child.mkdir()
+    assert icon(child)['source'] == str(project / 'icon.png')
+    (child / '.git').mkdir()
+    assert not icon(child)['found'], 'Do not inherit across a nested checkout'
+    print('PASS: browser extension declarations, linked web manifests, child web roots and Git icon boundaries')
+
 # Optional real-project acceptance is explicit and read-only.
 for argument in sys.argv[1:]:
     project = pathlib.Path(argument).expanduser().resolve(strict=True)
     result = icon(project)
     assert result['found'], f'{project.name} has no usable local icon'
-    print(f"PASS: {project.name}: {pathlib.Path(result['source']).relative_to(project)}")
+    print(f"PASS: {project.name}: {os.path.relpath(result['source'], project)}")

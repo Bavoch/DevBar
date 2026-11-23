@@ -35,71 +35,134 @@ final class ProjectIconLoader: @unchecked Sendable {
 
 enum ProjectIconResolver {
     static func resolve(_ path: String) -> ProjectIconAsset? {
-        let root = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath()
+        let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+        let fm = FileManager.default
+        guard (try? root.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return nil }
+        if let asset = resolveLocal(root) { return asset }
+
+        for name in ["web", "frontend", "client", "admin-ui", "admin"] {
+            let child = root.appendingPathComponent(name, isDirectory: true)
+            guard child.resolvingSymlinksInPath().path == child.path, !hasGitMarker(child),
+                  fm.fileExists(atPath: child.appendingPathComponent("package.json").path)
+                    || fm.fileExists(atPath: child.appendingPathComponent("index.html").path) else { continue }
+            if let asset = resolveLocal(child) { return asset }
+        }
+
+        // Allow a checkout's shared icon for subprojects, stopping at the nearest repository.
+        var directory = root
+        let excluded = ["node_modules", "vendor", "dist", "build", "out", "output", "target", "backups", "tmp", "work"]
+        for _ in 0...6 {
+            if hasGitMarker(directory) {
+                return directory == root ? nil : resolveLocal(directory)
+            }
+            guard !excluded.contains(directory.lastPathComponent) else { break }
+            let parent = directory.deletingLastPathComponent()
+            guard parent.path != directory.path, parent.path != "/" else { break }
+            directory = parent
+        }
+        return nil
+    }
+
+    private static func hasGitMarker(_ root: URL) -> Bool {
+        let path = root.appendingPathComponent(".git").path
+        let type = (try? FileManager.default.attributesOfItem(atPath: path)[.type]) as? FileAttributeType
+        return type == .typeDirectory || type == .typeRegular
+    }
+
+    private static func resolveLocal(_ root: URL) -> ProjectIconAsset? {
         var candidates: [URL] = []
 
-        func local(_ reference: String, base: URL, web: Bool = false) -> URL? {
-            let value = reference.components(separatedBy: "?")[0].components(separatedBy: "#")[0]
-                .removingPercentEncoding ?? reference
-            guard !value.isEmpty, !value.hasPrefix("//"), !value.contains(":") else { return nil }
-            let relative = value.hasPrefix("/") ? String(value.dropFirst()) : value
-            let file = (value.hasPrefix("/") ? root : base).appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
-            guard file.path.hasPrefix(root.path + "/") else { return nil }
-            if web, !FileManager.default.fileExists(atPath: file.path) {
-                return root.appendingPathComponent("public").appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
-            }
-            return file
+        func checked(_ url: URL) -> URL? {
+            let file = url.standardizedFileURL.resolvingSymlinksInPath()
+            return file.path.hasPrefix(root.path + "/") ? file : nil
+        }
+
+        func configuration(_ url: URL) -> [String: Any]? {
+            checked(url).flatMap(json)
+        }
+
+        func local(_ reference: String, base: URL, web: Bool = false) -> [URL] {
+            let path = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+                .components(separatedBy: CharacterSet(charactersIn: "?#"))[0]
+            guard let value = path.removingPercentEncoding, !value.isEmpty,
+                  !value.hasPrefix("//"), !value.contains(":") else { return [] }
+            let absolute = value.hasPrefix("/")
+            guard web || !absolute else { return [] }
+            let relative = absolute ? String(value.dropFirst()) : value
+            let publicFolder = root.appendingPathComponent("public", isDirectory: true)
+            let bases = web ? (absolute ? [publicFolder, root] : [base, publicFolder]) : [base]
+            return bases.compactMap { checked($0.appendingPathComponent(relative)) }
         }
 
         for file in ["src-tauri/tauri.conf.json", "tauri.conf.json"] {
             let url = root.appendingPathComponent(file)
-            if let json = json(url), let bundle = json["bundle"] as? [String: Any], let icons = bundle["icon"] as? [String] {
-                candidates += icons.compactMap { local($0, base: url.deletingLastPathComponent()) }
+            if let bundle = configuration(url)?["bundle"] as? [String: Any], let icons = bundle["icon"] as? [String] {
+                candidates += icons.flatMap { local($0, base: url.deletingLastPathComponent()) }
             }
         }
-        if let package = json(root.appendingPathComponent("package.json")), let build = package["build"] as? [String: Any] {
+        if let build = configuration(root.appendingPathComponent("package.json"))?["build"] as? [String: Any] {
             for platform in ["mac", "win", "linux"] {
-                if let icon = (build[platform] as? [String: Any])?["icon"] as? String, let url = local(icon, base: root) { candidates.append(url) }
+                if let icon = (build[platform] as? [String: Any])?["icon"] as? String { candidates += local(icon, base: root) }
             }
+            if let icon = build["icon"] as? String { candidates += local(icon, base: root) }
         }
-        for file in ["index.html", "public/index.html", "admin-ui/index.html"] {
-            let url = root.appendingPathComponent(file)
-            guard let data = boundedData(url, limit: 512_000), let html = String(data: data, encoding: .utf8) else { continue }
-            let links = matches("<link\\b[^>]*>", in: html)
-            for rel in ["icon", "apple-touch-icon"] {
-                for tag in links {
-                    let attributes = attributes(tag)
-                    let relation = (attributes["rel"] ?? "").lowercased().split(whereSeparator: \.isWhitespace)
-                    if relation.contains(Substring(rel)), let href = attributes["href"], let icon = local(href, base: url.deletingLastPathComponent(), web: true) {
-                        candidates.append(icon)
-                    }
+        let manifest = configuration(root.appendingPathComponent("manifest.json"))
+        if manifest?["manifest_version"] != nil {
+            var iconFields = [manifest?["icons"]]
+            for key in ["action", "browser_action", "page_action"] {
+                iconFields.append((manifest?[key] as? [String: Any])?["default_icon"])
+            }
+            for field in iconFields {
+                if let path = field as? String {
+                    candidates += local(path, base: root)
+                } else if let sizes = field as? [String: String] {
+                    let available = sizes.keys.compactMap { Int($0) }.filter { $0 > 0 }.sorted(by: >)
+                    let paths = available.compactMap { sizes[String($0)] }
+                    candidates += paths.flatMap { local($0, base: root) }
                 }
             }
         }
-        for file in ["public/manifest.webmanifest", "public/manifest.json", "manifest.webmanifest", "manifest.json"] {
-            let url = root.appendingPathComponent(file)
-            if let icons = json(url)?["icons"] as? [[String: Any]] {
-                candidates += icons.compactMap { ($0["src"] as? String).flatMap { local($0, base: url.deletingLastPathComponent(), web: true) } }
+        var webManifests: [URL] = []
+        for file in ["index.html", "public/index.html", "src/index.html"] {
+            guard let url = checked(root.appendingPathComponent(file)), let html = ProjectProfiles.text(url, limit: 512_000) else { continue }
+            let links = matches("<link\\b[^>]*>", in: html).map(attributes)
+            for link in links {
+                let relation = (link["rel"] ?? "").lowercased().split(whereSeparator: \.isWhitespace)
+                guard let href = link["href"] else { continue }
+                if relation.contains("icon") || relation.contains("apple-touch-icon") {
+                    candidates += local(href, base: url.deletingLastPathComponent(), web: true)
+                } else if relation.contains("manifest") {
+                    webManifests += local(href, base: url.deletingLastPathComponent(), web: true)
+                }
+            }
+        }
+        webManifests += ["public/manifest.webmanifest", "public/manifest.json", "manifest.webmanifest", "manifest.json"]
+            .map { root.appendingPathComponent($0) }
+        for url in webManifests {
+            if let icons = configuration(url)?["icons"] as? [[String: Any]] {
+                candidates += icons.compactMap { $0["src"] as? String }.flatMap {
+                    local($0, base: url.deletingLastPathComponent(), web: true)
+                }
             }
         }
         candidates += [
             "public/favicon.svg", "public/favicon.ico", "public/favicon.png", "app/icon.png", "app/icon.svg", "app/favicon.ico",
             "src/app/icon.png", "src/app/icon.svg", "src/app/favicon.ico", "public/apple-touch-icon.png",
             "src-tauri/icons/32x32.png", "src-tauri/icons/icon.icns", "src-tauri/icons/icon.png",
-            "resources/icon.icns", "assets/icon.png", "build/icon.icns", "icons/icon.png", "icons/icon.icns",
-            "public/logo.png", "public/logo.svg", "favicon.ico", "favicon.svg", "favicon.png", "icon.png", "logo.png",
-            "admin-ui/admin-favicon.ico"
+            "resources/icon.icns", "assets/icon.png", "build/icon.icns", "build/icon.png",
+            "icons/icon.png", "icons/icon.icns", "icons/icon-128.png", "icons/icon128.png",
+            "public/logo.png", "public/logo.svg", "favicon.ico", "favicon.svg", "favicon.png",
+            "icon.png", "icon.svg", "icon.icns", "logo.png", "logo.svg", "admin-ui/admin-favicon.ico"
         ].map { root.appendingPathComponent($0) }
         for base in ["Resources/Assets.xcassets/AppIcon.appiconset", "Assets.xcassets/AppIcon.appiconset", "mobile/ios/Resources/Assets.xcassets/AppIcon.appiconset"] {
             let catalog = root.appendingPathComponent(base)
-            if let images = json(catalog.appendingPathComponent("Contents.json"))?["images"] as? [[String: Any]] {
-                candidates += images.compactMap { ($0["filename"] as? String).flatMap { local($0, base: catalog) } }
+            if let images = configuration(catalog.appendingPathComponent("Contents.json"))?["images"] as? [[String: Any]] {
+                candidates += images.compactMap { $0["filename"] as? String }.flatMap { local($0, base: catalog) }
             }
         }
         var visited = Set<String>()
         for url in candidates {
-            let file = url.resolvingSymlinksInPath()
-            guard file.path.hasPrefix(root.path + "/"), visited.insert(file.path).inserted,
+            guard let file = checked(url), visited.insert(file.path).inserted,
                   let data = thumbnail(file) else { continue }
             return ProjectIconAsset(source: file.path, data: data)
         }

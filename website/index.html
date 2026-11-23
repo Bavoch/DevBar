@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="把 AI 帮你做的网站、应用和本地服务收进 Mac 菜单栏。用 DevBar 随时查看、运行、打开和停止本地项目。"
+    />
+    <meta name="theme-color" content="#064bff" />
+    <title>DevBar — Mac 菜单栏里的项目启动器</title>
+    <link rel="canonical" href="https://bavoch.github.io/DevBar/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="DevBar — Mac 菜单栏里的项目启动器" />
+    <meta
+      property="og:description"
+      content="从 Mac 菜单栏运行、打开和停止本地项目。"
+    />
+    <meta property="og:url" content="https://bavoch.github.io/DevBar/" />
+    <meta
+      property="og:image"
+      content="https://bavoch.github.io/DevBar/assets/devbar-panel.png"
+    />
+    <link rel="icon" href="./icon.png" />
+    <link rel="stylesheet" href="./style.css" />
+    <script src="./site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">跳至正文</a>
+    <header class="header">
+      <a class="wordmark" href="#top" aria-label="DevBar 首页">DevBar</a>
+      <nav aria-label="主导航">
+        <a href="#product">看看界面</a><a href="#use">如何使用</a>
+      </nav>
+    </header>
+    <main id="main" tabindex="-1">
+      <section class="hero" id="top">
+        <h1><span>AI 做好的，</span><span>随手就能用。</span></h1>
+        <div class="hero-bottom">
+          <p>把网站、应用和本地服务，<br />收进 Mac 菜单栏。</p>
+          <a class="hero-action" href="#install"
+            >获取 DevBar<img
+              src="./assets/arrow-down-right.svg"
+              width="28"
+              height="28"
+              alt=""
+          /></a>
+        </div>
+      </section>
+      <section class="product" id="product" aria-labelledby="product-title">
+        <div class="section-top">
+          <h2 id="product-title">项目都在。<br />终端可以收起来了。</h2>
+          <p>想用哪个，点开就好。<br />运行、打开、停止，都在这里。</p>
+        </div>
+        <div class="product-stage" data-stage>
+          <div class="product-image" data-panel>
+            <img
+              class="panel-shot"
+              src="./assets/devbar-panel.png"
+              width="400"
+              height="332"
+              alt="DevBar 菜单栏面板，显示示例项目的名称、运行状态和操作按钮"
+              loading="lazy"
+              decoding="async"
+            />
+          </div>
+          <div class="view-controls" role="group" aria-label="截图视图" hidden>
+            <button type="button" aria-pressed="true" data-view="full">
+              项目列表
+            </button>
+            <button type="button" aria-pressed="false" data-view="detail">
+              操作细节
+            </button>
+          </div>
+        </div>
+      </section>
+      <section class="use" id="use" aria-labelledby="use-title">
+        <h2 id="use-title">从一个文件夹，<br />到随时可用。</h2>
+        <ol class="steps" role="list">
+          <li>
+            <h3>加入项目</h3>
+            <p>点菜单栏中的＋，选中项目文件夹。</p>
+          </li>
+          <li>
+            <h3>点一下运行</h3>
+            <p>沿用项目已有的启动方式，入口就绪后自动打开。</p>
+          </li>
+          <li>
+            <h3>用完就停</h3>
+            <p>停止运行，项目仍留在列表，下次接着用。</p>
+          </li>
+        </ol>
+        <div class="local-note">
+          <p>无需账户。<br />项目和日志，留在本机。</p>
+          <p>
+            使用 DevBar 无需安装 Node，也无需打开终端。<br />项目本身需要的运行环境，仍需安装。
+          </p>
+        </div>
+      </section>
+      <section class="install" id="install">
+        <h2>从源码安装</h2>
+        <div class="install-detail">
+          <p>
+            需要 macOS 13 或更新版本，以及 Xcode Command Line Tools。v0.16.0
+            已在 GitHub 开源，正式安装包等待 Apple 签名与公证。
+          </p>
+          <a
+            class="release-link"
+            href="https://github.com/Bavoch/DevBar/releases/tag/v0.16.0"
+            >获取 v0.16.0 源码<img
+              src="./assets/arrow-up-right.svg"
+              width="22"
+              height="22"
+              alt=""
+          /></a>
+          <a class="install-guide" href="https://github.com/Bavoch/DevBar#安装"
+            >查看构建步骤</a
+          >
+        </div>
+      </section>
+    </main>
+    <footer class="footer">
+      <a href="#top">DevBar</a>
+      <nav aria-label="项目链接">
+        <a href="https://github.com/Bavoch/DevBar">GitHub</a>
+        <a href="https://github.com/Bavoch/DevBar/issues">报告问题</a>
+        <a href="https://github.com/Bavoch/DevBar/blob/main/LICENSE"
+          >MIT 许可证</a
+        >
+      </nav>
+    </footer>
+  </body>
+</html>

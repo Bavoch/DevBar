@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="DevBar product checks ") as folder:
         run([str(BINARY), flag])
     for script in ("verify_store_safety.py", "verify_detection_safety.py",
                    "verify_runtime_safety.py", "verify_unified_control.py", "verify_multi_target.py", "verify_interaction_latency.py",
-                   "verify_product_portability.py", "verify_distribution.py", "verify_sync.py",
+                   "verify_product_portability.py", "verify_distribution.py", "verify_icons.py", "verify_sync.py",
                    "verify_permission_ownership.py", "verify_development_isolation.py", "verify_development_entry.py"):
         run(["python3", "scripts/" + script])
 print("PASS: isolated product baseline (no publication or device acceptance)")

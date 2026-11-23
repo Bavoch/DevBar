@@ -1,19 +1,23 @@
 # Security policy
 
-DevBar inspects local processes and can run commands explicitly configured for a
-project. Treat project configuration as executable code: review it before running
-especially in an unfamiliar checkout. Discovery never grants permission to run a project.
-Runtime controls verify project ownership, process birth, user, executable and
-individual PIDs. Shared terminal/IDE process groups and AI tools are excluded.
-Discovery alone never sends signals; stopping or restarting requires an explicit action.
+The latest published DevBar version is the supported version for security
+fixes. Please check [GitHub Releases](https://github.com/Bavoch/DevBar/releases)
+for its version and distribution status.
 
-Do not post credentials, signing material, full private logs, or a working exploit
-containing personal data in public issues. Once this project is hosted on GitHub,
-use the repository's **Security → Report a vulnerability** private reporting entry
-if enabled. If unavailable, ask for a private reporting channel without publishing
-exploit details. A dedicated contact and supported release policy must be set by
-the repository owner before public release.
+## Report privately
 
-Reports should identify the affected version, prerequisites, impact and a minimal
-reproduction. There is no hosted telemetry or remote account required for the
-basic app; diagnostic files remain on the user's machine unless shared manually.
+Use [Report a vulnerability](https://github.com/Bavoch/DevBar/security/advisories/new)
+on GitHub. Include the DevBar and macOS versions, prerequisites, impact, and a
+minimal reproduction. Redact credentials, personal paths, and unrelated project
+data. Keep vulnerability details and full logs out of public issues.
+
+## Local execution and data
+
+DevBar inspects local processes and can run project commands. Review unfamiliar
+projects and their `.devbar.json` before running them. Adding and discovering
+projects does not execute their commands. DevBar checks process identity and
+project ownership before controlling a running instance.
+
+The core app requires no account and sends no project telemetry. Project lists
+and logs stay under `~/Library/Application Support/DevBar` unless you share them.
+Commands that you run through DevBar retain their own behavior and permissions.

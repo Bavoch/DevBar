@@ -1,27 +1,21 @@
 # 构建、验证与发布
 
-DevBar 是面向个人 AI 构建者公开分发的原生 macOS 工具。构建不会安装或启动应用，也不更改全局 AI 规则。
+## 验证源码版本
 
-## 本地验证
-
-完成一组完整修改后构建一次，再运行隔离检查：
+在 macOS 上构建一次，然后运行隔离检查。构建需要 Swift 5.9 或更新版本的 Xcode Command Line Tools，测试还需要 Python 3 和 Node.js。
 
 ```sh
 zsh scripts/build.sh
 python3 scripts/check-product.py
 ```
 
-检查只使用隔离配置和测试项目，不打开前台浏览器，不访问个人宿主资料，不发布项目。面板使用离屏渲染；真实用户的首次安装和原生交互另行验收。
+本地构建产物为 `dist/DevBar.app`。检查使用隔离配置和测试项目，浏览器测试保持无头运行。GitHub 的 [Product checks](https://github.com/Bavoch/DevBar/actions/workflows/ci.yml) 在 macOS runner 上执行相同基线。设备和宿主集成按 [平台矩阵](platform-matrix.md) 单独验收。
 
-基础检查覆盖进程与入口解析、面板行为、配置损坏保护、危险入口排除、进程归属与异常清理、多运行方式隔离、分发包搬迁和显式安装同步恢复。相关脚本见 `scripts/check-product.py`；设备和宿主检查按 [平台边界](platform-matrix.md) 单独选择。
+发布源码时，核对 `scripts/build.sh` 中的应用版本、`CHANGELOG.md` 和官网安装入口。用版本标签创建 GitHub Release，并在发行说明写明已验证的 macOS 和 CPU、已知限制与构建命令。GitHub 随标签自动提供源码归档。官网由 GitHub Pages 发布 `website/` 中的文件。
 
-历史 `verify_*.py` 中仍有旧协议时代的验收脚本，不能将脚本存在当作本版已通过的证据。以本版基础入口和本次审查记录为准。
+## 制作正式 macOS 安装包
 
-## 安装包
-
-`dist/DevBar.app` 包含程序、CLI、驱动与帮助文件。项目数据存放在用户应用支持目录，移动或升级 App 不删除数据。CLI 是可选功能，包内 `Contents/Resources/install-cli.sh` 安装到用户目录，已有其他同名命令不覆盖。
-
-本地默认临时签名，仅用于开发验证。发行需要 Developer ID Application 证书：
+通过 Developer ID Application 签名并提交 Apple 公证。将公证凭据保存为本机钥匙串 profile。
 
 ```sh
 DEVBAR_SIGN_IDENTITY='Developer ID Application: …' \
@@ -29,6 +23,10 @@ DEVBAR_NOTARY_PROFILE='已配置的钥匙串 profile' \
 zsh scripts/package-release.sh --notarize
 ```
 
-脚本构建并检查产物、执行签名验证，上传 Apple 公证、装订票据、核对 Gatekeeper，最后重新打包并生成 SHA-256。无 `--notarize` 时只能生成已签名但未公证的验证包，不能标为正式发行。密钥不得写入仓库或日志。
+脚本构建并运行基础检查，验证签名，上传 Apple 公证，装订票据并核对 Gatekeeper。成功后生成 `dist/DevBar-<版本>-<架构>.zip` 和同名 `.sha256`。可以在归档目录运行 `shasum -a 256 -c DevBar-<版本>-<架构>.zip.sha256` 核对下载内容。省略 `--notarize` 时，文件名以 `-unnotarized.zip` 结尾，供内部验证。
 
-当前脚本构建本机 CPU 架构，未提供已经验收的 universal 包。发布前核对应用身份、版本与变更记录，在承诺支持的 macOS 与 CPU 上分别验证；并完成干净账户安装、退出后管理恢复、升级数据保留、辅助功能及支持渠道检查。源码授权和安全报告入口由维护者确定。[公开分发状态](open-source-readiness.md)
+在每个承诺支持的 CPU 上构建并验收对应产物。用干净账户从实际下载的归档验证首次打开、添加项目、运行与停止、退出后恢复管理、键盘操作及升级后数据保留。验收完成后，上传 ZIP 和校验文件到对应 GitHub Release，再更新官网与 README 的安装入口。
+
+`DevBar.app` 自带 CLI、驱动与帮助文件。项目列表与日志保存在 `~/Library/Application Support/DevBar`。升级时替换 App 即可保留数据。CLI 安装脚本位于 `Contents/Resources/install-cli.sh`，默认在用户目录安装，并保护已存在的同名命令。
+
+[Apple Developer ID 证书说明](https://developer.apple.com/help/account/certificates/create-developer-id-certificates) · [Apple 公证文档](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution/)

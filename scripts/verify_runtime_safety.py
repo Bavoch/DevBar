@@ -16,10 +16,11 @@ BINARY = os.environ.get('DEVBAR_TEST_BINARY', str(ROOT / '.build/release/DevBar'
 (ROOT / 'work').mkdir(exist_ok=True)
 
 
-def unused_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+def distinct_ports():
+    with socket.socket() as first, socket.socket() as second:
+        first.bind(('127.0.0.1', 0))
+        second.bind(('127.0.0.1', 0))
+        return first.getsockname()[1], second.getsockname()[1]
 
 
 def alive(pid):
@@ -40,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
     base = Path(folder)
     project = base / 'project'; project.mkdir()
     state = base / 'state'
-    port, outside_port = unused_port(), unused_port()
+    port, outside_port = distinct_ports()
     child_file = base / 'child.pid'
     (project / 'app.py').write_text(
         'import http.server,pathlib,subprocess,sys\n'
@@ -66,6 +67,23 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
         except OSError:
             return False
 
+    def start_outsider():
+        with (base / 'outsider.log').open('w+') as log:
+            process = subprocess.Popen(
+                [sys.executable, '-m', 'http.server', str(outside_port), '--bind', '127.0.0.1'],
+                cwd=project, stdout=subprocess.DEVNULL, stderr=log,
+            )
+            outsiders.append(process)
+
+            def ready():
+                if process.poll() is not None:
+                    log.seek(0)
+                    raise AssertionError(f'Independent command exited {process.returncode}: {log.read()}')
+                return listening(outside_port)
+
+            until(ready, 'Independent same-directory command did not start')
+        return process
+
     identifier = cli('--add-project', str(project), '--command', shlex.quote(sys.executable) + ' -u app.py').stdout.strip()
     try:
         for command in ('python3 -m http.server 0 &', 'nohup python3 -m http.server 0'):
@@ -77,10 +95,7 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
         cli('--start-project', identifier)
         until(lambda: listening(port) and child_file.exists(), 'Managed command did not start')
         fixture_pids.add(int(child_file.read_text()))
-        outsider = subprocess.Popen([sys.executable, '-m', 'http.server', str(outside_port), '--bind', '127.0.0.1'],
-                                    cwd=project, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        outsiders.append(outsider)
-        until(lambda: listening(outside_port), 'Independent same-directory command did not start')
+        outsider = start_outsider()
         cli('--stop-project', identifier)
         until(lambda: not listening(port), 'Owned command was not stopped')
         assert listening(outside_port) and outsider.poll() is None, 'Stop affected an independent command in the same folder'
@@ -94,10 +109,7 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
         outsider.wait(timeout=5)
         cli('--stop-project', identifier)
         until(lambda: not listening(port), 'Restarted runtime did not stop')
-        outsider = subprocess.Popen([sys.executable, '-m', 'http.server', str(outside_port), '--bind', '127.0.0.1'],
-                                    cwd=project, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        outsiders.append(outsider)
-        until(lambda: listening(outside_port), 'External runtime did not start again')
+        outsider = start_outsider()
         cli('--stop-project', identifier)
         outsider.wait(timeout=5)
         assert not listening(outside_port)

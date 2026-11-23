@@ -1,8 +1,24 @@
 # DevBar
 
-给个人 AI 构建者的轻量 macOS 菜单栏工具。把 AI 帮你做的网站、应用和本地服务放在一起，随时查看、运行、打开和停止。
+DevBar 是 macOS 菜单栏里的本地项目启动器。把用 AI 做的网站、应用和本地服务集中在一起，随时运行、打开或停止。
 
-无需账户，也无需为了使用 DevBar 安装 Node 或打开终端。项目本身需要的运行环境仍需安装。基本功能在本机工作，不上传项目或日志。
+[产品官网](https://bavoch.github.io/DevBar/) · [版本发布](https://github.com/Bavoch/DevBar/releases) · [报告问题](https://github.com/Bavoch/DevBar/issues) · [MIT 许可证](LICENSE)
+
+![DevBar 菜单栏面板中的示例项目列表](website/assets/devbar-panel.png)
+
+## 安装
+
+当前公开版本提供源码。需要 macOS 13 或更新版本，以及 Swift 5.9 或更新版本的 Xcode Command Line Tools。
+
+```sh
+git clone --branch v0.16.0 https://github.com/Bavoch/DevBar.git
+cd DevBar
+zsh scripts/build.sh
+```
+
+构建完成后，把 `dist/DevBar.app` 拖进「应用程序」，打开 DevBar，再从菜单栏进入。源码构建使用本机临时签名。正式下载包将在完成 [Apple 签名与公证](docs/release.md) 后提供。
+
+DevBar 无需账户。日常使用无需 Node 或终端，具体项目所需的运行环境仍需安装。项目列表和日志保存在本机。
 
 ## 使用
 
@@ -32,28 +48,13 @@
 
 手机应用、浏览器插件、小程序、容器和宿主插件需要相应设备、工具或专用配置。它们的支持边界与验证条件见 [平台说明](docs/platform-matrix.md)。库、素材和备份目录不会被强行创建运行入口。
 
-## 安装与发布状态
+## 数据与开发
 
-需要 macOS 13 或更新版本。目前仓库提供源码构建流程，正式公开发行仍需完成 [发布检查](docs/release.md)。未经 Developer ID 签名、公证和 Gatekeeper 验证的本地构建不能当作正式安装包分发。
+项目列表和日志保存在 `~/Library/Application Support/DevBar`。移除列表记录不会删除项目，升级 App 会保留列表和日志。分享诊断信息前，请检查项目日志里可能含有的敏感内容。
 
-开发模式需要 Node/npm 和 Swift 工具链，在仓库目录执行：
+想开发 DevBar 时，在安装 Node/npm 后运行 `npm run dev`。源码变更会触发重新编译并重启开发实例。用 `npm run dev:status` 查看状态，或运行 `npm run dev:stop` 停止开发会话。
 
-```sh
-npm run dev
-```
-
-首次启动会编译开发入口，然后建立后台开发会话。修改 `Sources`、`Package.swift` 或 `drivers` 后自动重新编译并重启应用；Swift 原生界面通过重启更新。命令返回或关闭终端后会话仍会继续，使用 `npm run dev:status` 查看状态、`npm run dev:stop` 停止。若提示安装版冲突，请先手动退出安装版 DevBar。
-
-从源码构建应用包只需 Swift 工具链：
-
-```sh
-zsh scripts/build.sh
-python3 scripts/check-product.py
-```
-
-生成的 `dist/DevBar.app` 自带所需驱动和帮助文件，可以移动到其他目录。构建不会安装、启动 DevBar，也不会修改你的项目或全局 AI 规则。
-
-项目列表和日志保存在 `~/Library/Application Support/DevBar`，升级应用不会删除它们。日志可能包含项目自行输出的敏感信息，分享前请先检查。[安全报告](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [变更记录](CHANGELOG.md)
+[贡献指南](CONTRIBUTING.md) · [安全报告](SECURITY.md) · [变更记录](CHANGELOG.md)
 
 ## 可选命令行
 

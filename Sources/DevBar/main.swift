@@ -567,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let table = (try? ProcessTable.read()) ?? [:]
         presentation = ProjectPresentation.read(saved: saved, store: store, table: table)
         runs = presentation.runs
-        applyIcons(iconLoader.load(paths: saved.map(\.path)))
+        applyIcons(iconLoader.load(paths: saved.map(\.path) + projects.map(\.path)))
         rebuild()
         return menu.items.map(MenuSnapshot.init)
     }
@@ -672,7 +672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for index in projects.indices where saved.contains(where: { $0.path == projects[index].path }) {
                     if let phase = RuntimeFreshnessInspector.inspect(projects[index], persist: true) { projects[index].freshness = phase }
                 }
-                let icons = iconLoader.load(paths: saved.map(\.path))
+                let icons = iconLoader.load(paths: saved.map(\.path) + projects.map(\.path))
                 return (projects.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }, saved, presentation, icons)
             }
             DispatchQueue.main.async {
@@ -728,12 +728,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let models: [PanelProject] = menu.items.compactMap { row in
             guard let path = row.representedObject as? String, let child = row.submenu else { return nil }
             let project = running[path]
-            let failed = project?.freshness?.state == .failed
-                || presentation.targetPhases[path]?.values.contains(.failed) == true
-                || (project?.isRunning != true && configs[path].flatMap { runs[$0.id]?.exitCode }
-                    .map { ![0, 130, 143].contains($0) } == true)
+            let open = child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) }
+            let control = child.items.first { $0.identifier?.rawValue == "control" }
+            let activity = project.flatMap { project -> String? in
+                guard project.isRunning else { return nil }
+                return open?.action == #selector(openOwnPanel) ? "桌面应用" : project.activityDetail
+            }
             let detail = messages[path] ?? operations[path]
-                ?? (failed ? "运行失败 · 可重试" : (project?.freshness?.state == .starting ? "启动中" : displayPath(path)))
+                ?? activity
+                ?? (project?.freshness?.state == .starting ? "启动中"
+                    : (launchFailed(project, config: configs[path]) ? "运行失败" : "已停止"))
             let options = NSMenu()
             if let copied = child.copy() as? NSMenu {
                 for entry in copied.items { copied.removeItem(entry); options.addItem(entry) }
@@ -741,8 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return PanelProject(path: path, name: row.title, detail: detail,
                 isRunning: project?.isRunning == true,
                 icon: projectImages[path] ?? fallbackIcon,
-                open: child.items.first { $0.identifier?.rawValue == "entry-0" && ($0.action != nil || $0.submenu != nil) },
-                control: child.items.first { $0.identifier?.rawValue == "control" }, more: options,
+                open: open, control: control, more: options,
                 operation: operations[path] ?? (project?.freshness?.state == .starting && project?.isRunning != true ? "启动中" : nil))
         }
         panel.update(models, running: projects.filter(\.isRunning).count, error: error, scanning: scanning)
@@ -781,6 +784,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         parent.addItem(row)
     }
 
+    private func launchFailed(_ project: Project?, config: SavedProject?) -> Bool {
+        guard project?.isRunning != true, project?.freshness?.state != .starting else { return false }
+        if project?.freshness?.state == .failed { return true }
+        guard let config, let run = runs[config.id] else { return false }
+        let target = run.targetID ?? presentation.selectedTargets[config.path]
+        if let target, presentation.targetPhases[config.path]?[target] == .failed { return true }
+        return run.exitCode.map { ![0, 130, 143].contains($0) } ?? false
+    }
+
     private func makeMenu() -> NSMenu {
         let root = NSMenu()
         let activity = presentation.activity
@@ -800,10 +812,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             (right, configs[right]?.name ?? running[right]?.name ?? right))
         }
         for path in paths {
-            if let project = running[path] {
+            let project = running[path]
+            let managed = !(presentation.activeTargets[path] ?? []).isEmpty
+            if let project, project.isRunning || project.freshness?.state == .starting || managed || configs[path] == nil {
                 projectRow(name: configs[path]?.name ?? project.name, path: path, submenu: makeProjectMenu(project), to: root)
             } else if let config = configs[path] {
-                projectRow(name: config.name, path: path, submenu: makeStoppedMenu(config), to: root)
+                projectRow(name: config.name, path: path, submenu: makeStoppedMenu(config, failed: launchFailed(project, config: config)), to: root)
             }
         }
         if paths.isEmpty && error == nil { note(scanning ? "扫描中…" : "暂无项目", to: root) }
@@ -817,12 +831,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return root
     }
 
-    private func makeStoppedMenu(_ config: SavedProject) -> NSMenu {
+    private func makeStoppedMenu(_ config: SavedProject, failed: Bool) -> NSMenu {
         let child = NSMenu()
         note(displayPath(config.path), to: child)
-        let failed = runs[config.id]?.exitCode.map { ![0, 130, 143].contains($0) } ?? false
         if let message = messages[config.path] { note(message, to: child) }
-        else if failed { note("启动失败", to: child) }
+        else if failed { note("运行失败", to: child) }
         child.addItem(.separator())
         if let operation = operations[config.path] { note(operation, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
         else { add(failed ? "重试" : "运行", action: #selector(startProject(_:)), value: config.id, to: child).identifier = NSUserInterfaceItemIdentifier("control") }
@@ -870,6 +883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("打开网页", action: #selector(openURL(_:)), value: webpageURL(listener, config: config), to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
         let managed = !(presentation.activeTargets[project.path] ?? []).isEmpty
+        let failed = launchFailed(project, config: config)
         if project.freshness?.state == .starting, !project.isRunning, operations[project.path] == nil {
             note("启动中", to: child).identifier = NSUserInterfaceItemIdentifier("entry-0")
         }
@@ -877,8 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             note(operation, to: child).identifier = NSUserInterfaceItemIdentifier("control")
         } else if managed, let config, let run = runs[config.id] {
             let count = presentation.activeTargets[config.path]?.count ?? 0
-            let failed = run.targetID.flatMap { presentation.targetPhases[config.path]?[$0] } == .failed || project.freshness?.state == .failed
-            let retry = failed && !project.isRunning && count == 1 && (run.targetID == nil || run.targetID == presentation.selectedTargets[config.path])
+            let retry = failed && count == 1 && (run.targetID == nil || run.targetID == presentation.selectedTargets[config.path])
             let value = project.path
             let row = add(retry ? "重试" : "停止", action: retry ? #selector(restartProject(_:)) : #selector(stopProject(_:)),
                           value: retry ? config.id : value, to: child)
@@ -903,7 +916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add(title, action: #selector(copyURL(_:)), value: listener.url, to: more)
         }
         if !project.entryPoints.isEmpty { more.addItem(.separator()) }
-        if managed, project.freshness?.state == .failed || presentation.targetPhases[project.path]?.values.contains(.failed) == true {
+        if child.items.contains(where: { $0.identifier?.rawValue == "control" && $0.action == #selector(restartProject(_:)) }) {
             add("停止", action: #selector(stopProject(_:)), value: project.path, to: more)
         }
         let management = makeMoreMenu(path: project.path, config: config)
@@ -1115,10 +1128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         precondition(placeholder.isEnabled && placeholder.action == #selector(openURL(_:)))
         precondition(stop.title == "停止")
         inactiveDesktop.desktop?.pid = 101
+        inactiveDesktop.freshness = RuntimeFreshness(state: .failed, reason: "上一次命令已退出")
         precondition(inactiveDesktop.activityDetail == "桌面应用")
         projects = [inactiveDesktop]
         rebuild()
         precondition(placeholder.isEnabled && placeholder.action == #selector(openDesktop(_:)))
+        precondition(!launchFailed(inactiveDesktop, config: config) && stop.title == "停止")
         projects = [initial]
         updateProjectMenus()
         precondition(placeholder.title.contains("启动中"))
@@ -1132,6 +1147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let stoppedChild = menu.items.first(where: { $0.representedObject as? String == path })!.submenu!
         precondition(stoppedChild === child)
         precondition(stop.title == "运行" && stop.action == #selector(startProject(_:)))
+        let failed = Project(path: path, name: "Fixture", listeners: [], processes: [], entryPoints: [], auxiliaryServices: [],
+                             freshness: RuntimeFreshness(state: .failed, reason: "命令已退出"))
+        presentation.activeTargets[path] = []
+        projects = [failed]
+        rebuild()
+        precondition(launchFailed(failed, config: config) && stop.title == "重试" && stop.action == #selector(startProject(_:)))
         precondition(pollInterval == 10)
         menuOpen = true
         precondition(pollInterval == 3)

@@ -15,8 +15,10 @@ with tempfile.TemporaryDirectory(prefix='Relocated product ',dir=ROOT/'work') as
     info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
     version=subprocess.check_output([str(wrapper),'--version'],text=True).strip()
     assert version == f"DevBar {info['CFBundleShortVersionString']} ({info['CFBundleVersion']})",version
-    for document in ('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md'):
+    for document in ('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE'):
         assert (app/'Contents/Resources'/document).is_file(), document
+    icon = app/'Contents/Resources'/info['CFBundleIconFile']
+    assert icon.read_bytes().startswith(b'icns'), icon
     project=base/'Independent project';project.mkdir()
     (project/'package.json').write_text(json.dumps({'scripts':{'dev':'python3 -m http.server 0 --bind 127.0.0.1'}}))
     env=dict(os.environ,DEVBAR_CLI_DIR=str(base/'bin'),DEVBAR_DATA_DIR=str(base/'state'))

@@ -13,19 +13,21 @@ fi
 zsh scripts/build.sh
 python3 scripts/check-product.py
 version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/DevBar.app/Contents/Info.plist)"
-architecture="$(uname -m)"
+architecture="$(lipo -archs dist/DevBar.app/Contents/MacOS/DevBar)"
 codesign --verify --deep --strict dist/DevBar.app
-archive="$PWD/dist/DevBar-$version-$architecture.zip"
-ditto -c -k --keepParent dist/DevBar.app "$archive"
+stage="$(mktemp -d "$PWD/dist/.release.XXXXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+name="DevBar-$version-$architecture.zip"
 if [[ "${1:-}" == --notarize ]]; then
-  xcrun notarytool submit "$archive" --keychain-profile "$DEVBAR_NOTARY_PROFILE" --wait
+  ditto -c -k --keepParent dist/DevBar.app "$stage/submission.zip"
+  xcrun notarytool submit "$stage/submission.zip" --keychain-profile "$DEVBAR_NOTARY_PROFILE" --wait
   xcrun stapler staple dist/DevBar.app
   xcrun stapler validate dist/DevBar.app
   spctl --assess --type execute dist/DevBar.app
-  ditto -c -k --keepParent dist/DevBar.app "$archive"
-  shasum -a 256 "$archive" > "$archive.sha256"
-  print "Notarized: $archive"
 else
-  shasum -a 256 "$archive" > "$archive.sha256"
-  print "Signed, not notarized: $archive"
+  name="${name%.zip}-unnotarized.zip"
 fi
+ditto -c -k --keepParent dist/DevBar.app "$stage/$name"
+(cd "$stage" && shasum -a 256 "$name" > "$name.sha256")
+mv "$stage/$name" "$stage/$name.sha256" "$PWD/dist/"
+print "Packaged: $PWD/dist/$name"

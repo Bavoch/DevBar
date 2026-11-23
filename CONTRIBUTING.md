@@ -37,7 +37,11 @@ local acceptance records out of contributions. Project-specific absolute paths
 may belong in local configuration, not product defaults. Preserve explicit user
 configuration and other targets when changing setup or migrations.
 
-## Pull requests
+## Issues and pull requests
+
+Use [GitHub Issues](https://github.com/Bavoch/DevBar/issues) for bugs and feature
+requests. Use [private reporting](SECURITY.md) for security issues.
+Submissions are covered by the [MIT license](LICENSE).
 
 Explain the trigger, resulting behavior, relevant validation, and unverified
 platforms. Fixes need focused regressions when they affect process ownership,
