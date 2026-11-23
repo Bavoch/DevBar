@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,5 +23,5 @@ with tempfile.TemporaryDirectory(prefix="DevBar product checks ") as folder:
                    "verify_runtime_safety.py", "verify_unified_control.py", "verify_multi_target.py", "verify_interaction_latency.py",
                    "verify_product_portability.py", "verify_distribution.py", "verify_icons.py", "verify_sync.py",
                    "verify_permission_ownership.py", "verify_development_isolation.py", "verify_development_entry.py"):
-        run(["python3", "scripts/" + script])
+        run([sys.executable, "scripts/" + script])
 print("PASS: isolated product baseline (no publication or device acceptance)")

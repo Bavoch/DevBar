@@ -100,7 +100,10 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
             until(ready, 'Managed command did not start')
         except AssertionError as error:
             details = log.read_text() if log.exists() else 'No managed command log'
-            raise AssertionError(f'{error}\n{details}') from error
+            listener = subprocess.run(['/usr/sbin/lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'],
+                                      capture_output=True, text=True).stdout.strip()
+            raise AssertionError(f'{error}\nChild PID file exists: {child_file.exists()}\n'
+                                 f'Loopback listener: {listener or "none"}\n{details}') from error
 
     identifier = cli('--add-project', str(project), '--command', shlex.quote(sys.executable) + ' -u app.py').stdout.strip()
     try:

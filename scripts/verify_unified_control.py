@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='Unified control ', dir=ROOT / 'work') a
 @end
 int main(void) { @autoreleasepool {
  NSApplication *application=NSApplication.sharedApplication;
- [application setActivationPolicy:NSApplicationActivationPolicyProhibited];
+ [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
  Delegate *delegate=[Delegate new]; application.delegate=delegate;
  [[NSString stringWithFormat:@"%d",getpid()] writeToFile:PID_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
  [application run];
@@ -210,8 +210,13 @@ int main(void) { @autoreleasepool {
             wait(gone)
             print('PASS: managed native build stays starting; Quit refusal preserves the app and its launcher; retry stops normally')
         finally:
+            allow_file.touch()
+            subprocess.run([BINARY, '--stop-project', native_id], env=env, capture_output=True, timeout=45)
+            if pid_file.exists():
+                native_pid = int(pid_file.read_text())
             current=subprocess.run(['ps','-p',str(native_pid),'-o','comm='],text=True,capture_output=True).stdout.strip()
-            if current == str(executable): os.kill(native_pid, signal.SIGTERM)
+            if current in (str(executable), './build/Fixture.app/Contents/MacOS/Fixture'):
+                os.kill(native_pid, signal.SIGTERM)
     finally:
         if identifier:
             subprocess.run([BINARY, '--stop-project', identifier], env=env, capture_output=True, timeout=45)

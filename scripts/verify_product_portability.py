@@ -35,9 +35,12 @@ with tempfile.TemporaryDirectory(prefix='Product portability ', dir=ROOT / 'work
     write(developer / 'usr/bin/xcodebuild', '#!/bin/sh\ntouch MUST_NOT_RUN\n')
     (developer / 'usr/bin/xcodebuild').chmod(0o755)
     selected = dict(env, DEVELOPER_DIR=str(developer.parent.parent))
-    assert cli('doctor', native, selected)['capabilities'][0]['launch'] == 'available'
+    native_capability = cli('doctor', native, selected)['capabilities'][0]
+    native_issues = {issue['code'] for issue in native_capability['issues']}
+    assert 'environmentMissing' not in native_issues and 'launchCommandRejected' in native_issues, native_capability
     invalid = dict(env, DEVELOPER_DIR=str(base / 'CommandLineTools'))
-    assert cli('doctor', native, invalid)['capabilities'][0]['launch'] == 'blocked'
+    native_capability = cli('doctor', native, invalid)['capabilities'][0]
+    assert any(issue['code'] == 'environmentMissing' for issue in native_capability['issues']), native_capability
     assert cli('inventory', workspace, invalid)['state'] == 'unconfirmed'
     assert not (native / 'MUST_NOT_RUN').exists()
 
