@@ -26,6 +26,8 @@ with tempfile.TemporaryDirectory(prefix='Product portability ', dir=ROOT / 'work
     tools = base / 'tools'
     write(tools / 'npm', '#!/bin/sh\nexit 99\n')
     (tools / 'npm').chmod(0o755)
+    write(tools / 'xcodegen', '#!/bin/sh\ntouch MUST_NOT_RUN\n')
+    (tools / 'xcodegen').chmod(0o755)
     env['PATH'] = str(tools) + ':/usr/bin:/bin'
     native = workspace / 'Native'
     write(native / 'project.yml', 'name: Native\ntargets:\n  Native:\n    type: application\n    platform: iOS\n')

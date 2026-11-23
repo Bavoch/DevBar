@@ -67,7 +67,9 @@ with tempfile.TemporaryDirectory(prefix='Unified control ', dir=ROOT / 'work') a
     restarted_terminal = None
     mixed_runtime = None
     def cli(*args):
-        return subprocess.run([BINARY, *args], env=env, text=True, capture_output=True, check=True, timeout=60)
+        result = subprocess.run([BINARY, *args], env=env, text=True, capture_output=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result
     try:
         wait(lambda: ready(main_port) and ready(tool_port) and ready(other_port) and ready(helper_port))
         assert not (state / 'projects.json').exists()
@@ -183,9 +185,13 @@ int main(void) { @autoreleasepool {
             wait(gone)
             print('PASS: discovered native app receives graceful Quit; unsaved-work refusal stays running; retry exits normally')
             # Exercise the same refusal through DevBar's own build/launch chain.
-            (native_project / 'Info.plist').write_bytes((native/'Contents/Info.plist').read_bytes())
+            (native_project / 'package.json').write_text(json.dumps({
+                'scripts': {'dev': 'zsh scripts/dev.sh'},
+                'devDependencies': {'electron': '0.0.0'},
+            }))
+            (native_project / 'node_modules').mkdir()
             (native_project / 'scripts').mkdir()
-            (native_project / 'scripts/build.sh').write_text('sleep 4\n')
+            (native_project / 'scripts/dev.sh').write_text('sleep 4\nexec ./build/Fixture.app/Contents/MacOS/Fixture\n')
             allow_file.unlink()
             pid_file.unlink()
             cli('--start-project', native_id)

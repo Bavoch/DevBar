@@ -84,6 +84,24 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
             until(ready, 'Independent same-directory command did not start')
         return process
 
+    def wait_for_managed_server():
+        log = state / (identifier + '.log')
+
+        def ready():
+            if listening(port):
+                return child_file.exists()
+            states = [json.loads(file.read_text()) for file in (state / 'development').glob('*.json')]
+            if any(session['phase'] == 'failed' for session in states):
+                details = log.read_text() if log.exists() else str(states)
+                raise AssertionError('Managed command failed:\n' + details)
+            return False
+
+        try:
+            until(ready, 'Managed command did not start')
+        except AssertionError as error:
+            details = log.read_text() if log.exists() else 'No managed command log'
+            raise AssertionError(f'{error}\n{details}') from error
+
     identifier = cli('--add-project', str(project), '--command', shlex.quote(sys.executable) + ' -u app.py').stdout.strip()
     try:
         for command in ('python3 -m http.server 0 &', 'nohup python3 -m http.server 0'):
@@ -93,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix='Runtime ownership ', dir=ROOT / 'work')
             assert result.returncode != 0 and '前台' in result.stderr, result.stderr
             cli('--remove-project', detached)
         cli('--start-project', identifier)
-        until(lambda: listening(port) and child_file.exists(), 'Managed command did not start')
+        wait_for_managed_server()
         fixture_pids.add(int(child_file.read_text()))
         outsider = start_outsider()
         cli('--stop-project', identifier)
