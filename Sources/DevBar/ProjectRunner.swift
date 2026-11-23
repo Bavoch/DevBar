@@ -90,19 +90,25 @@ enum ProjectRunner {
         let table = try ProcessTable.read(pids: identities.map(\.pid))
         let identities = verifiedControls(observation, table: table)
         var native = Set<Int>()
-        for process in identities where process.executable.contains(".app/Contents/MacOS/")
-            && !process.executable.contains("/Frameworks/") && URL(fileURLWithPath: process.executable).lastPathComponent != "DevBar" {
+        for process in identities {
+            guard let app = NSRunningApplication(processIdentifier: pid_t(process.pid)), !app.isTerminated,
+                  let executable = app.executableURL, executable.path.contains(".app/Contents/MacOS/"),
+                  !executable.path.contains("/Frameworks/"), executable.lastPathComponent != "DevBar" else { continue }
             // Our isolated headless extension browser has no application event
             // loop for Quit. Its exact identity can use normal process shutdown.
             let arguments = (try? Discovery.run("/bin/ps", ["-ww", "-p", String(process.pid), "-o", "args="])) ?? ""
             let privateProfile = ProjectStore().directory.appendingPathComponent("browsers/").path
             if arguments.contains("--headless"), arguments.contains("--load-extension="),
                arguments.contains("--user-data-dir=" + privateProfile) { continue }
-            if let app = NSRunningApplication(processIdentifier: pid_t(process.pid)), !app.isTerminated,
-               app.executableURL?.path == process.executable {
-                guard app.terminate() else { throw failure("应用暂时无法停止，请保存当前工作后重试") }
-                native.insert(process.pid)
-            }
+            guard !verifiedControls(observation, table: try ProcessTable.read(process.pid)).isEmpty else { continue }
+            // ps can report the launcher's relative argv[0] rather than the
+            // executable path registered with Launch Services.
+            var path = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(pid_t(process.pid), &path, UInt32(path.count)) > 0,
+                  URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath().path
+                    == executable.resolvingSymlinksInPath().path else { throw failure("无法核对应用身份，请在原启动位置退出") }
+            guard app.terminate() else { throw failure("应用暂时无法停止，请保存当前工作后重试") }
+            native.insert(process.pid)
         }
         if !native.isEmpty {
             let deadline = Date().addingTimeInterval(max(grace, 3))
